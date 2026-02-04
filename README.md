@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="150" alt="Life logo">
+</p>
+
 # Life
 
 > Research project exploring the minimal conditions required for the emergence of a synthetic self.
