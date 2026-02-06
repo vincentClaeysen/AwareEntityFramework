@@ -72,11 +72,18 @@ class StarField:
 class LifeOrganism:
     def __init__(self):
         self.sim_time = 0.0
-        self.config = {"cycle_duration": 3.0, "expansion_ratio": 0.4, "max_height_ratio": 0.80, "min_height_ratio": 0.45, "particle_count": 6500}
+        self.config = {
+            "cycle_duration": 3.0, 
+            "expansion_ratio": 0.4, 
+            "max_height_ratio": 0.80, 
+            "min_height_ratio": 0.45, 
+            "particle_count": 6500
+        }
+        self.pending_duration = 3.0
         self.unit_h = 3.7 
         self.recalculate_curves()
 
-        # NOYAU (QUADS -15% Vol)
+        # NOYAU (QUADS -15% Volume)
         self.res_u, self.res_v = 40, 40
         self.base_radius_factor = (0.62 / 0.83) * 0.85 
         self.rot_core = [0.0, 0.0, 0.0]
@@ -88,29 +95,32 @@ class LifeOrganism:
         self.drift_memb = [random.uniform(0.15, 0.35) * 2.5 for _ in range(3)]
         self.particles = [[random.uniform(0, 2*math.pi), math.acos(random.uniform(-1,1)), random.random()] for _ in range(self.config["particle_count"])]
 
-        # CHROMATIQUE NÉON (2 COULEURS PAR ÉTAT)
-        # État A : Bleu Électrique / Violet
-        self.palette_a = np.array([[0.0, 0.3, 1.0], [0.6, 0.0, 1.0]], dtype=float)
-        # État B : Or Étincelant / Orange Électrique
-        self.palette_b = np.array([[1.0, 0.8, 0.0], [1.0, 0.2, 0.0]], dtype=float)
-        
+        # CHROMATIQUE NÉON
+        self.palette_a = np.array([[0.0, 0.3, 1.0], [0.6, 0.0, 1.0]], dtype=float) # Bleu/Violet
+        self.palette_b = np.array([[1.0, 0.8, 0.0], [1.0, 0.2, 0.0]], dtype=float) # Or/Orange
         self.current_palette = self.palette_a.copy()
         self.target_palette = self.palette_a.copy()
         self.is_transitioning = False
         self.transition_progress = 0
 
     def recalculate_curves(self):
+        """Génère les tables d'accélération exponentielle (EXP) et logarithmique (RET)"""
         self.resp_lut = []
-        total_f = int(self.config["cycle_duration"] * FPS)
+        total_f = max(1, int(self.config["cycle_duration"] * FPS))
         exp_f = int(total_f * self.config["expansion_ratio"])
         ret_f = total_f - exp_f
         min_r, max_r = (self.config["min_height_ratio"] * self.unit_h)/2.0, (self.config["max_height_ratio"] * self.unit_h)/2.0
+        
         for f in range(exp_f):
             t = f / exp_f
             self.resp_lut.append(min_r + (max_r - min_r) * (1 - math.pow(1-t, 3)))
         for f in range(ret_f):
             t = f / ret_f
             self.resp_lut.append(min_r + (max_r - min_r) * (1 - (math.log(1 + 9*t)/math.log(10))))
+
+    def adjust_duration(self, delta):
+        self.pending_duration = max(0.25, self.pending_duration + delta)
+        print(f"Période en attente : {self.pending_duration}s")
 
     def trigger_mutation(self):
         if not self.is_transitioning:
@@ -121,19 +131,30 @@ class LifeOrganism:
 
     def _get_color(self, val):
         mix = max(0.0, min(1.0, val))
-        # Interpolation directe entre les deux couleurs de la palette actuelle
         return self.current_palette[0] * (1.0 - mix) + self.current_palette[1] * mix
 
     def update(self):
         dt = 1.0 / FPS
         total_f = len(self.resp_lut)
-        self.current_radius = self.resp_lut[int((self.sim_time * FPS) % total_f)]
+        current_index = int((self.sim_time * FPS) % total_f)
+        
+        # CONDITION DE RECALCUL : Rétractation max ET changement de valeur
+        if current_index == 0 and self.config["cycle_duration"] != self.pending_duration:
+            self.config["cycle_duration"] = self.pending_duration
+            self.recalculate_curves()
+            self.sim_time = 0.0
+            total_f = len(self.resp_lut)
+            current_index = 0
+
+        self.current_radius = self.resp_lut[current_index]
         self.current_core_base = self.current_radius * self.base_radius_factor
+        
         self.sim_time += dt
         self.starfield.update(dt)
         for i in range(3):
             self.rot_core[i] += self.drift_core[i]
             self.rot_memb[i] += self.drift_memb[i]
+            
         if self.is_transitioning:
             self.transition_progress += 1
             t = self.transition_progress / 25.0
@@ -145,7 +166,7 @@ class LifeOrganism:
         brightness = np.mean(self.current_palette) * (self.current_radius / 1.5)
         glDisable(GL_DEPTH_TEST); self.starfield.draw(brightness)
 
-        # NOYAU (QUADS)
+        # NOYAU (QUADS OPAQUES)
         glEnable(GL_DEPTH_TEST); glPushMatrix()
         glTranslatef(0.0, math.sin(self.sim_time * 0.5) * 0.03, 0.0)
         glRotatef(self.rot_core[0], 1,0,0); glRotatef(self.rot_core[1], 0,1,0); glRotatef(self.rot_core[2], 0,0,1)
@@ -163,7 +184,7 @@ class LifeOrganism:
                     glVertex3f(x_r * r, y_r * r, z_r * r)
         glEnd(); glPopMatrix()
 
-        # MEMBRANE (ARRONDIE & NÉON)
+        # MEMBRANE (ARRONDIE & BALANCED LUMINESCENCE)
         glDisable(GL_DEPTH_TEST); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         glPushMatrix()
         glRotatef(self.rot_memb[0], 1,0,0); glRotatef(self.rot_memb[1], 0,1,0); glRotatef(self.rot_memb[2], 0,0,1)
@@ -173,7 +194,6 @@ class LifeOrganism:
             r = self.current_radius + (self.current_radius * wave)
             x, y, z = r*math.sin(phi)*math.cos(theta), r*math.cos(phi), r*math.sin(phi)*math.sin(theta)
             depth = ((z/r)+1.0)*0.4 + 0.2
-            # Mix chromatique binaire (Bleu/Violet ou Or/Orange)
             c = self._get_color((math.sin(self.sim_time*0.7 + theta*1.5 + seed*6.28)+1.0)*0.5)
             rad = (3.4 + abs(wave) * 20.25) * depth
             glColor4f(c[0]*rad, c[1]*rad, c[2]*rad, 0.9*depth)
@@ -182,14 +202,17 @@ class LifeOrganism:
 
 def main():
     pygame.init(); pygame.display.set_mode((WIDTH, HEIGHT), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("LIFE 2025 - Neon Electric Dual")
+    pygame.display.set_caption("LIFE 2025 - Optimized Sync")
     clock = pygame.time.Clock(); gluPerspective(45, WIDTH/HEIGHT, 0.1, 50.0)
     glTranslatef(0.0, 0.0, -4.5); glEnable(GL_POINT_SMOOTH); glPointSize(1.5)
     organism = LifeOrganism()
     while True:
         for event in pygame.event.get():
             if event.type == QUIT: pygame.quit(); return
-            if event.type == KEYDOWN and event.key == K_s: organism.trigger_mutation()
+            if event.type == KEYDOWN:
+                if event.key == K_s: organism.trigger_mutation()
+                if event.key == K_LEFT: organism.adjust_duration(-0.25)
+                if event.key == K_RIGHT: organism.adjust_duration(0.25)
         organism.update(); organism.draw(); pygame.display.flip(); clock.tick(FPS)
 
 if __name__ == "__main__":
