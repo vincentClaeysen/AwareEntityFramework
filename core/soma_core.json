@@ -1,0 +1,160 @@
+{
+  "sampling_profiles": {
+    "slow": {
+      "frequency": 1.0,
+      "description": "Profil lent pour les métriques système (CPU, RAM, température, batterie)"
+    },
+    "fast": {
+      "frequency": 200.0,
+      "description": "Profil rapide pour l'IMU et capteurs haute fréquence"
+    }
+  },
+  "default_sampling_profile": "slow",
+
+  "metrics": {
+    "cpu": {
+      "alias": "Charge CPU",
+      "flux_topic": "soma/cpu",
+      "threshold_GT": [40, 65, 85],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "absolute_delta_threshold": 1.5
+    },
+    "memory": {
+      "alias": "Mémoire",
+      "flux_topic": "soma/memory",
+      "threshold_GT": [50, 80, 95],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "absolute_delta_threshold": 1.0
+    },
+    "temperature": {
+      "alias": "Température",
+      "flux_topic": "soma/temperature",
+      "threshold_GT": [70, 95, 105],
+      "sampling_profile": "slow",
+      "output_freq_min": 0.01,
+      "output_freq_max": 10.0,
+      "absolute_delta_threshold": 0.5,
+      "_comment": "Événement spécial: déclenche alerte critique > 105°C"
+    },
+    "energy": {
+      "alias": "Énergie",
+      "flux_topic": "soma/energy",
+      "threshold_LT": [60, 30, 15],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "absolute_delta_threshold": 1.0,
+      "_comment": "Seuils LT dans l'ordre DÉCROISSANT [60, 30, 15]. f_base=1Hz. Utilisé UNIQUEMENT pour stress ego, pas pour publication."
+    },
+    "energy_discharge": {
+      "alias": "Décharge Batterie",
+      "flux_topic": "energy/discharge",
+      "threshold_GT": [40, 70, 85],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "absolute_delta_threshold": 1.0,
+      "_comment": "Métrique virtuelle: 100 - battery_percent. GT [40,70,85] = batterie à [60,30,15]%. Fréquence monte quand batterie baisse. Publié UNIQUEMENT sur batterie (pas en charge)."
+    },
+    "imu_pitch_forward": {
+      "alias": "Inclinaison vers l'avant",
+      "flux_topic": "soma/imu/pitch_forward",
+      "threshold_GT": [15, 30, 45],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 2.0
+    },
+    "imu_pitch_backward": {
+      "alias": "Inclinaison vers l'arrière",
+      "flux_topic": "soma/imu/pitch_backward",
+      "threshold_GT": [10, 25, 40],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 2.0
+    },
+    "imu_roll_left": {
+      "alias": "Inclinaison vers la gauche",
+      "flux_topic": "soma/imu/roll_left",
+      "threshold_GT": [10, 30, 60],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 2.0
+    },
+    "imu_roll_right": {
+      "alias": "Inclinaison vers la droite",
+      "flux_topic": "soma/imu/roll_right",
+      "threshold_GT": [10, 30, 60],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 2.0
+    },
+    "imu_yaw_left": {
+      "alias": "Rotation vers la gauche",
+      "flux_topic": "soma/imu/yaw_left",
+      "threshold_GT": [20, 50, 100],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 5.0
+    },
+    "imu_yaw_right": {
+      "alias": "Rotation vers la droite",
+      "flux_topic": "soma/imu/yaw_right",
+      "threshold_GT": [20, 50, 100],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 5.0
+    },
+    "imu_front_accel": {
+      "alias": "Accélération vers l'avant",
+      "flux_topic": "soma/imu/front_accel",
+      "threshold_GT": [2.0, 5.0, 10.0],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 0.5
+    },
+    "imu_back_accel": {
+      "alias": "Accélération vers l'arrière",
+      "flux_topic": "soma/imu/back_accel",
+      "threshold_GT": [2.0, 5.0, 10.0],
+      "sampling_profile": "fast",
+      "output_freq_min": 1.0,
+      "output_freq_max": 100.0,
+      "absolute_delta_threshold": 0.5
+    },
+    "ego": {
+      "alias": "Ego Global",
+      "flux_topic": "soma/ego",
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "_comment": "Nerf global avec coefficients de mixage configurables",
+      "mixing_coefficients": {
+        "cpu": 1.0,
+        "memory": 1.0,
+        "temperature": 2.5,
+        "energy": 2.0,
+        "imu_pitch_forward": 0.5,
+        "imu_pitch_backward": 0.5,
+        "imu_roll_left": 0.4,
+        "imu_roll_right": 0.4,
+        "imu_yaw_left": 0.3,
+        "imu_yaw_right": 0.3,
+        "imu_front_accel": 0.8,
+        "imu_back_accel": 0.8
+      },
+      "normalization": "weighted_rms",
+      "_normalization_options": ["weighted_rms", "max", "mean"]
+    }
+  }
+}
