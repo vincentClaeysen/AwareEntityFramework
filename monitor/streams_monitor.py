@@ -139,6 +139,32 @@ class StreamLine:
             return recent
 
 # ============================================================================
+# Groupe pliable/dépliable
+# ============================================================================
+
+class CollapsibleGroup:
+    def __init__(self, name, elements, x, y, width):
+        self.name = name
+        self.elements = elements
+        self.x = x
+        self.y = y
+        self.width = width
+        self.expanded = True
+        self.height = 30  # Hauteur du titre uniquement
+        self.collapsed_height = 30
+        self.expanded_height = 30 + len(elements) * 120  # Titre + éléments
+        
+    def toggle(self):
+        self.expanded = not self.expanded
+        
+    def get_height(self):
+        return self.expanded_height if self.expanded else self.collapsed_height
+    
+    def contains_point(self, px, py):
+        return (self.x <= px <= self.x + self.width and 
+                self.y <= py <= self.y + 30)  # Seulement la zone du titre est cliquable
+
+# ============================================================================
 # Main Visualizer (Pygame Edition)
 # ============================================================================
 
@@ -160,18 +186,25 @@ class StreamsVisualizer:
         
         # Streams & Groups
         self.streams = {}
+        self.groups = []
         self._setup_subscribers()
+        self._setup_groups()
         
-        # Pygame Setup
-        self.screen = pygame.display.set_mode((1400, 900), pygame.RESIZABLE)  # Plus large pour les payloads
+        # Pygame Setup - Taille initiale 800x600
+        self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
         pygame.display.set_caption("LIFE 2025 - Écho du Vide")
-        self.font_main = pygame.font.SysFont("Monospace", 18, bold=True)
-        self.font_small = pygame.font.SysFont("Monospace", 12)
-        self.font_payload = pygame.font.SysFont("Monospace", 10)  # Police plus petite pour les payloads
+        
+        # Polices
+        self.font_main = pygame.font.SysFont("Monospace", 16, bold=True)
+        self.font_small = pygame.font.SysFont("Monospace", 11)
+        self.font_payload = pygame.font.SysFont("Monospace", 9)
+        
         self.clock = pygame.time.Clock()
         self.running = True
         self.last_stats_time = time.time()
         self.frame_count = 0
+        self.scroll_offset = 0
+        self.max_scroll = 0
         
         logger.info(f"StreamsVisualizer initialized with {self.target_fps} FPS target")
 
@@ -219,6 +252,21 @@ class StreamsVisualizer:
                 except Exception as e:
                     logger.error(f"Failed to subscribe to {topic}: {e}")
 
+    def _setup_groups(self):
+        """Initialise les groupes pliables"""
+        y_offset = 60
+        for group_config in self.config['groups']:
+            elements = [self.streams[el['topic']] for el in group_config['elements']]
+            group = CollapsibleGroup(
+                group_config['name'],
+                elements,
+                10,  # x
+                y_offset,  # y
+                self.screen.get_width() - 20  # width
+            )
+            self.groups.append(group)
+            y_offset += group.get_height() + 10
+
     def _zenoh_callback(self, sample):
         topic = str(sample.key_expr)
         try:
@@ -232,13 +280,10 @@ class StreamsVisualizer:
 
     def draw(self):
         self.screen.fill((5, 5, 5))
-        y_offset = 60
-        margin = 20
         win_w, win_h = self.screen.get_size()
         
-        # Largeur de l'oscilloscope (avec espace pour le payload)
-        osc_width = int(win_w * 0.6)  # 60% pour l'oscilloscope
-        payload_width = win_w - osc_width - margin * 2  # Le reste pour le payload
+        # Dessiner une bordure autour de la fenêtre
+        pygame.draw.rect(self.screen, (30, 30, 30), (0, 0, win_w, win_h), 2)
         
         # Calcul FPS
         self.frame_count += 1
@@ -249,21 +294,63 @@ class StreamsVisualizer:
             self.last_stats_time = now
         
         # Header
-        header_text = f"🧠 STREAMS VISUALIZER - FENÊTRE: {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
+        header_text = f"🧠 STREAMS VISUALIZER - {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
         header_surf = self.font_main.render(header_text, True, (0, 255, 255))
         self.screen.blit(header_surf, (win_w//2 - header_surf.get_width()//2, 15))
+        
+        # Mise à jour des positions des groupes (pour le scrolling)
+        y_offset = 60 - self.scroll_offset
+        for group in self.groups:
+            group.y = y_offset
+            y_offset += group.get_height() + 10
+        
+        # Calcul du scroll maximum
+        total_height = sum(g.get_height() + 10 for g in self.groups) + 60
+        self.max_scroll = max(0, total_height - win_h + 50)
+        
+        # Dessiner les groupes
+        for group in self.groups:
+            self._draw_group(group, win_w)
 
-        for group in self.config['groups']:
-            # Titre Groupe
-            group_label = self.font_main.render(f"[Groupe: {group['name']}]", True, (0, 191, 255))
-            self.screen.blit(group_label, (margin, y_offset))
-            y_offset += 30
+    def _draw_group(self, group, win_w):
+        # Fond du groupe
+        group_rect = pygame.Rect(group.x, group.y, group.width, group.get_height())
+        
+        # Titre du groupe (toujours visible)
+        title_rect = pygame.Rect(group.x, group.y, group.width, 30)
+        
+        # Fond du titre avec dégradé
+        for i in range(30):
+            color_value = 20 + i
+            pygame.draw.line(self.screen, (color_value, color_value, color_value), 
+                           (group.x, group.y + i), (group.x + group.width, group.y + i))
+        
+        # Bordure du titre
+        pygame.draw.rect(self.screen, (60, 60, 60), title_rect, 1)
+        
+        # Icône de pliage/dépliage
+        icon = "▼" if group.expanded else "▶"
+        icon_surf = self.font_main.render(icon, True, (0, 191, 255))
+        self.screen.blit(icon_surf, (group.x + 5, group.y + 7))
+        
+        # Nom du groupe
+        name_surf = self.font_main.render(f"GROUPE: {group.name}", True, (0, 191, 255))
+        self.screen.blit(name_surf, (group.x + 25, group.y + 7))
+        
+        # Si le groupe est expandé, dessiner les streams
+        if group.expanded:
+            # Légère ombre pour la séparation
+            pygame.draw.line(self.screen, (40, 40, 40), 
+                           (group.x, group.y + 30), (group.x + group.width, group.y + 30), 1)
             
-            for el in group['elements']:
-                stream = self.streams[el['topic']]
-                if y_offset + 120 <= win_h:
-                    self._draw_stream(stream, margin, y_offset, osc_width, 100, payload_width)
-                    y_offset += 120
+            stream_y = group.y + 40
+            for stream in group.elements:
+                # Largeurs adaptatives
+                osc_width = int(win_w * 0.55)  # 55% pour l'oscilloscope
+                payload_width = win_w - osc_width - 40  # Le reste pour le payload
+                
+                self._draw_stream(stream, group.x + 10, stream_y, osc_width, 90, payload_width)
+                stream_y += 100
 
     def _draw_stream(self, stream, x, y, w, h, payload_width):
         now = time.time()
@@ -273,14 +360,13 @@ class StreamsVisualizer:
         halo_intensity = stream.color_engine.get_halo_intensity(stream.current_frequency, stream.type)
         
         # ===== DESSIN DE L'OSCILLOSCOPE =====
-        # Dessiner le halo (effet de lueur)
-        for i in range(5, 0, -1):
-            alpha = int(15 * halo_intensity * (i / 5))
+        # Dessiner le halo uniquement sur le cadre
+        for i in range(3, 0, -1):
+            alpha = int(20 * halo_intensity * (i / 3))
             if alpha > 0:
-                halo_surf = pygame.Surface((w, h), pygame.SRCALPHA)
-                halo_color = (*base_color, alpha)
-                pygame.draw.rect(halo_surf, halo_color, (0, 0, w, h), 3)
-                self.screen.blit(halo_surf, (x, y))
+                # Dessiner le halo comme un contour plus épais
+                halo_rect = pygame.Rect(x - i, y - i, w + 2*i, h + 2*i)
+                pygame.draw.rect(self.screen, (*base_color, alpha), halo_rect, 2)
         
         # Fond sombre
         pygame.draw.rect(self.screen, (10, 10, 10), (x, y, w, h))
@@ -292,16 +378,15 @@ class StreamsVisualizer:
         pygame.draw.line(self.screen, line_color, (x, mid_y), (x + w, mid_y), 2)
         
         # Point représentant l'instant courant (extrême droite)
-        pygame.draw.circle(self.screen, (255, 255, 255), (x + w, mid_y), 4)
-        pygame.draw.circle(self.screen, base_color, (x + w, mid_y), 2)
+        pygame.draw.circle(self.screen, (255, 255, 255), (x + w, mid_y), 3)
         
         # Récupérer les impulsions récentes
         recent_impulses = stream.get_recent_impulses(now)
         
-        # Hauteur fixe des pics (90% de la moitié de l'oscilloscope)
-        peak_h = int(h * 0.45)  # 90% de la moitié (h/2 * 0.9)
+        # Hauteur fixe des pics
+        peak_h = int(h * 0.4)  # 40% de la hauteur totale
         
-        # Dessiner les pics (crêtes) - tous de la même hauteur
+        # Dessiner les pics (forme de /\ spontané)
         for timestamp, payload in recent_impulses:
             # Calculer la position x basée sur le timestamp
             age = now - timestamp
@@ -312,26 +397,19 @@ class StreamsVisualizer:
             color_intensity = 0.5 + 0.5 * (1.0 - age / stream.window_duration)
             pic_color = self._interpolate_color(base_color, (255, 255, 255), color_intensity)
             
-            # Dessiner le pic (ligne verticale) - hauteur fixe
-            # Effet de trail pour les pics récents
-            if progress > 0.8:  # Derniers 20% de la fenêtre
-                for trail in range(3):
-                    trail_x = px - trail * 2
-                    if trail_x >= x:
-                        trail_alpha = 0.3 * (1 - trail/3)
-                        trail_color = self._interpolate_color(pic_color, base_color, trail_alpha)
-                        pygame.draw.line(self.screen, trail_color, 
-                                       (trail_x, mid_y), (trail_x, mid_y - peak_h), 2)
-            
-            # Pic principal
-            pygame.draw.line(self.screen, pic_color, 
-                           (px, mid_y), (px, mid_y - peak_h), 3)
-            
-            # Point au sommet
-            if progress > 0.9:  # Point plus brillant pour les pics très récents
-                pygame.draw.circle(self.screen, (255, 255, 255), (px, mid_y - peak_h), 3)
-            else:
-                pygame.draw.circle(self.screen, pic_color, (px, mid_y - peak_h), 2)
+            # Dessiner le pic en forme de /\ (deux lignes)
+            if px > x and px < x + w:
+                # Ligne gauche du /\
+                pygame.draw.line(self.screen, pic_color,
+                               (px - 3, mid_y - peak_h),
+                               (px, mid_y), 2)
+                # Ligne droite du /\
+                pygame.draw.line(self.screen, pic_color,
+                               (px + 3, mid_y - peak_h),
+                               (px, mid_y), 2)
+                
+                # Petit point au sommet
+                pygame.draw.circle(self.screen, (255, 255, 255), (px, mid_y - peak_h), 2)
         
         # Informations textuelles sur l'oscilloscope
         topic_color = (0, 191, 255) if stream.type == "nerf" else (255, 165, 0)
@@ -341,15 +419,10 @@ class StreamsVisualizer:
         # Fréquence et compteur
         freq_text = f"{stream.current_frequency:.1f} Hz | {stream.message_count} msgs"
         txt_freq = self.font_small.render(freq_text, True, base_color)
-        self.screen.blit(txt_freq, (x + 5, y + h - 40))
-        
-        # Indicateur d'intensité du halo
-        halo_indicator = "█" * int(halo_intensity * 10)
-        txt_halo = self.font_small.render(halo_indicator, True, base_color)
-        self.screen.blit(txt_halo, (x + 5, y + h - 20))
+        self.screen.blit(txt_freq, (x + 5, y + h - 35))
         
         # ===== ZONE D'AFFICHAGE DU PAYLOAD =====
-        payload_x = x + w + 20  # Espace après l'oscilloscope
+        payload_x = x + w + 10
         payload_y = y
         payload_h = h
         
@@ -357,57 +430,56 @@ class StreamsVisualizer:
         pygame.draw.rect(self.screen, (15, 15, 15), (payload_x, payload_y, payload_width, payload_h))
         pygame.draw.rect(self.screen, base_color, (payload_x, payload_y, payload_width, payload_h), 1)
         
-        # Titre de la zone payload
-        payload_title = self.font_small.render("📦 DERNIER PAYLOAD", True, base_color)
-        self.screen.blit(payload_title, (payload_x + 5, payload_y + 5))
-        
         # Afficher le dernier payload
         if stream.last_payload:
             # Formater le payload de façon lisible
-            payload_str = json.dumps(stream.last_payload, indent=None)
+            payload_str = json.dumps(stream.last_payload)
             
-            # Découper le payload en lignes pour l'affichage
-            max_chars = int(payload_width / 7)  # Approx caractères par ligne
-            words = payload_str.split()
+            # Découper le payload en lignes
+            max_chars = int(payload_width / 6)
             lines = []
             current_line = ""
             
-            for word in words:
-                if len(current_line) + len(word) + 1 <= max_chars:
-                    current_line += (" " + word if current_line else word)
+            for char in payload_str:
+                if len(current_line) < max_chars:
+                    current_line += char
                 else:
-                    if current_line:
-                        lines.append(current_line)
-                    current_line = word
+                    lines.append(current_line)
+                    current_line = char
             
             if current_line:
                 lines.append(current_line)
             
-            # Si le payload est trop long, tronquer
-            if len(lines) > 4:
-                lines = lines[:4]
-                lines[-1] = lines[-1] + "..."
+            # Limiter à 3 lignes maximum
+            lines = lines[:3]
             
             # Afficher chaque ligne
-            line_y = payload_y + 25
+            line_y = payload_y + 10
             for line in lines:
                 payload_surf = self.font_payload.render(line, True, (200, 200, 200))
                 self.screen.blit(payload_surf, (payload_x + 5, line_y))
-                line_y += 15
-            
-            # Horodatage du dernier message
-            if stream.last_message_time:
-                time_str = time.strftime("%H:%M:%S", time.localtime(stream.last_message_time))
-                time_surf = self.font_payload.render(f"🕐 {time_str}", True, (150, 150, 150))
-                self.screen.blit(time_surf, (payload_x + 5, payload_y + payload_h - 18))
+                line_y += 12
         else:
             # Aucun message reçu
-            no_data = self.font_payload.render("⏳ En attente de données...", True, (100, 100, 100))
-            self.screen.blit(no_data, (payload_x + 5, payload_y + 40))
+            no_data = self.font_payload.render("⏳...", True, (100, 100, 100))
+            self.screen.blit(no_data, (payload_x + 5, payload_y + 15))
 
     def _interpolate_color(self, c1, c2, t):
         """Interpole entre deux couleurs RGB"""
         return tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3))
+
+    def handle_click(self, pos):
+        """Gère les clics souris pour plier/déplier les groupes"""
+        for group in self.groups:
+            if group.contains_point(pos[0], pos[1]):
+                group.toggle()
+                logger.debug(f"Group {group.name} toggled: {'expanded' if group.expanded else 'collapsed'}")
+                return True
+        return False
+
+    def handle_scroll(self, y_scroll):
+        """Gère le scrolling"""
+        self.scroll_offset = max(0, min(self.max_scroll, self.scroll_offset - y_scroll))
 
     def run(self):
         logger.info(f"Starting visualization loop at {self.target_fps} FPS")
@@ -422,6 +494,16 @@ class StreamsVisualizer:
                         self.running = False
                     elif event.type == pygame.VIDEORESIZE:
                         self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                        # Recalculer les largeurs de groupes
+                        for group in self.groups:
+                            group.width = self.screen.get_width() - 20
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1:  # Clic gauche
+                            self.handle_click(event.pos)
+                        elif event.button == 4:  # Molette haut
+                            self.handle_scroll(30)
+                        elif event.button == 5:  # Molette bas
+                            self.handle_scroll(-30)
                 
                 # Rendu
                 self.draw()
