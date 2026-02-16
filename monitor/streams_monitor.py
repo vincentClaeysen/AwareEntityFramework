@@ -12,7 +12,7 @@ import pygame
 import math
 
 # --- Configuration des logs ---
-logger = logging.getLogger("StreamsVisualizer")
+logger = logging.getLogger("StreamsMonitor")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s"))
@@ -168,7 +168,7 @@ class CollapsibleGroup:
 # Main Visualizer (Pygame Edition)
 # ============================================================================
 
-class StreamsVisualizer:
+class StreamsMonitor:
     def __init__(self, config_filepath):
         pygame.init()
         
@@ -188,7 +188,6 @@ class StreamsVisualizer:
         self.streams = {}
         self.groups = []
         self._setup_subscribers()
-        self._setup_groups()
         
         # Pygame Setup - Taille initiale 800x600
         self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
@@ -206,7 +205,10 @@ class StreamsVisualizer:
         self.scroll_offset = 0
         self.max_scroll = 0
         
-        logger.info(f"StreamsVisualizer initialized with {self.target_fps} FPS target")
+        # Initialiser les groupes APRÈS avoir créé l'écran
+        self._setup_groups()
+        
+        logger.info(f"StreamsMonitor initialized with {self.target_fps} FPS target")
 
     def _setup_signal_handlers(self):
         def signal_handler(sig, frame):
@@ -294,7 +296,7 @@ class StreamsVisualizer:
             self.last_stats_time = now
         
         # Header
-        header_text = f"🧠 STREAMS VISUALIZER - {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
+        header_text = f"🧠 STREAMS MONITOR - {self.window_duration}s | FPS: {getattr(self, 'fps', 0)}/{self.target_fps}"
         header_surf = self.font_main.render(header_text, True, (0, 255, 255))
         self.screen.blit(header_surf, (win_w//2 - header_surf.get_width()//2, 15))
         
@@ -355,7 +357,7 @@ class StreamsVisualizer:
     def _draw_stream(self, stream, x, y, w, h, payload_width):
         now = time.time()
         
-        # Couleur de base basée sur la fréquence
+        # Couleur de base basée sur la fréquence (couleur du cadre)
         base_color = stream.color_engine.get_color_from_frequency(stream.current_frequency, stream.type)
         halo_intensity = stream.color_engine.get_halo_intensity(stream.current_frequency, stream.type)
         
@@ -370,12 +372,12 @@ class StreamsVisualizer:
         
         # Fond sombre
         pygame.draw.rect(self.screen, (10, 10, 10), (x, y, w, h))
+        # Cadre de l'oscilloscope (couleur basée sur la fréquence)
         pygame.draw.rect(self.screen, base_color, (x, y, w, h), 1)
         
-        # Ligne horizontale centrale (le "temps")
+        # Ligne horizontale centrale (le "temps") - couleur du cadre
         mid_y = y + h // 2
-        line_color = self._interpolate_color(base_color, (200, 200, 200), 0.7)
-        pygame.draw.line(self.screen, line_color, (x, mid_y), (x + w, mid_y), 2)
+        pygame.draw.line(self.screen, base_color, (x, mid_y), (x + w, mid_y), 1)
         
         # Récupérer les impulsions récentes
         recent_impulses = stream.get_recent_impulses(now)
@@ -383,60 +385,18 @@ class StreamsVisualizer:
         # Hauteur fixe des pics
         peak_h = int(h * 0.4)  # 40% de la hauteur totale
         
-        # Trouver le pic le plus récent (s'il existe)
-        most_recent_pic = None
-        if recent_impulses:
-            # Le dernier pic est celui avec le timestamp le plus grand
-            most_recent_pic = max(recent_impulses, key=lambda x: x[0])
-            recent_timestamp, recent_payload = most_recent_pic
-        
-        # Dessiner les pics (forme de /\ partant de la ligne centrale)
+        # Dessiner les pics (simples lignes verticales de la couleur du cadre)
         for timestamp, payload in recent_impulses:
             # Calculer la position x basée sur le timestamp
             age = now - timestamp
             progress = 1.0 - (age / stream.window_duration)  # 0 = vieux, 1 = récent
             px = x + int(w * progress)
             
-            # Couleur du pic (plus intense si récent)
-            color_intensity = 0.5 + 0.5 * (1.0 - age / stream.window_duration)
-            pic_color = self._interpolate_color(base_color, (255, 255, 255), color_intensity)
-            
-            # Dessiner le pic en forme de /\ partant de la ligne centrale
+            # Dessiner une simple ligne verticale de la couleur du cadre
             if px > x and px < x + w:
-                # Ligne gauche du /\ (de la ligne centrale vers le haut)
-                pygame.draw.line(self.screen, pic_color,
-                               (px - 3, mid_y - peak_h),  # Sommet gauche
-                               (px, mid_y),  # Base au centre
-                               2)
-                # Ligne droite du /\ (de la ligne centrale vers le haut)
-                pygame.draw.line(self.screen, pic_color,
-                               (px + 3, mid_y - peak_h),  # Sommet droit
-                               (px, mid_y),  # Base au centre
-                               2)
-                
-                # Petit point au sommet
-                pygame.draw.circle(self.screen, (255, 255, 255), (px, mid_y - peak_h), 2)
-                
-                # Petite ligne verticale à la base pour renforcer l'effet
-                pygame.draw.line(self.screen, pic_color,
-                               (px, mid_y - 1),
-                               (px, mid_y + 1), 1)
-        
-        # === POINT BLANC SUR LE PIC LE PLUS RÉCENT ===
-        if most_recent_pic:
-            # Calculer la position du pic le plus récent
-            recent_age = now - recent_timestamp
-            recent_progress = 1.0 - (recent_age / stream.window_duration)
-            recent_px = x + int(w * recent_progress)
-            
-            if recent_px > x and recent_px < x + w:
-                # Dessiner le point blanc au sommet du pic le plus récent
-                pygame.draw.circle(self.screen, (255, 255, 255), (recent_px, mid_y - peak_h), 5)
-                # Petit halo autour du point
-                pygame.draw.circle(self.screen, (*base_color, 100), (recent_px, mid_y - peak_h), 8, 1)
-        else:
-            # Si pas de pic, garder le point à l'extrême droite comme avant
-            pygame.draw.circle(self.screen, (255, 255, 255), (x + w, mid_y), 3)
+                pygame.draw.line(self.screen, base_color,
+                               (px, mid_y - peak_h),
+                               (px, mid_y), 1)
         
         # Informations textuelles sur l'oscilloscope
         topic_color = (0, 191, 255) if stream.type == "nerf" else (255, 165, 0)
@@ -562,8 +522,8 @@ if __name__ == "__main__":
     config_path = sys.argv[1] if len(sys.argv) > 1 else "streams_config.json"
     
     try:
-        logger.info(f"Starting StreamsVisualizer with config: {config_path}")
-        viz = StreamsVisualizer(config_path)
+        logger.info(f"Starting StreamsMonitor with config: {config_path}")
+        viz = StreamsMonitor(config_path)
         viz.run()
     except FileNotFoundError:
         logger.error(f"Configuration file not found: {config_path}")
