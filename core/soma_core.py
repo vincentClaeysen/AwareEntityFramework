@@ -8,17 +8,19 @@ import signal
 import sys
 import os
 import collections
-import numpy as np
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Dict
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime, timezone
-from scipy.stats import linregress
 import subprocess
+import statistics
+
+# --- Ajout pour le PubScheduler ---
+from pub_scheduler import PubScheduler
 
 # --- Configuration des logs ---
 logger = logging.getLogger("SomaCore")
-logger.setLevel(logging.INFO)  # Changé à INFO pour réduire le flood
+logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s"))
 logger.addHandler(handler)
@@ -37,117 +39,150 @@ WINDOW_SIZE = 20
 SALVE_SIZE = 3
 WARMUP_SAMPLES = 10
 LIFE_NOISE_PERIOD = 1.0
-FREQ_MIN = 0.01
+FREQ_MIN = 1.0
 FREQ_MAX = 200.0
 PERIODE_VALIDITE = 1.0
-TEMP_SEUIL_BAS = 15
-TEMP_SEUIL_HAUT = 30
+PRECISION_DECIMALES = 2
 
-# ===== BATTERY MANAGEMENT =====
-class BatteryMonitor:
-    """
-    Moniteur de batterie avec estimation temps de charge/décharge
-    L'estimation s'affine progressivement avec plus de données
-    """
-    def __init__(self, battery_capacity_wh: float = 50.0):
-        self.battery_capacity_wh = battery_capacity_wh  # Capacité en Wh
-        self.history = collections.deque(maxlen=20)  # Historique étendu pour meilleur affinement
-        self.last_level = None
-        self.last_timestamp = None
-        
-    def update(self, level: float, charging: bool, timestamp: float):
-        """
-        Met à jour l'état de la batterie et calcule les estimations
-        
-        L'estimation du temps restant s'affine au fur et à mesure :
-        - 2-5 échantillons : estimation grossière
-        - 5-10 échantillons : estimation moyenne
-        - 10-20 échantillons : estimation précise
-        
-        Args:
-            level: Niveau batterie (%)
-            charging: État de charge
-            timestamp: Timestamp actuel
-        
-        Returns:
-            dict: Informations enrichies sur la batterie
-        """
-        # Ajouter à l'historique
-        self.history.append((timestamp, level, charging))
-        
-        # Calculer le taux de variation
-        charge_rate = 0.0  # %/s
-        discharge_rate = 0.0  # %/s
-        quality = "unknown"
-        time_remaining = None
-        confidence = "low"  # Niveau de confiance de l'estimation
-        
-        if len(self.history) >= 2:
-            # Adapter la fenêtre selon le nombre d'échantillons disponibles
-            # Plus on a de données, plus la fenêtre est grande = estimation stable
-            window_size = min(len(self.history), max(5, len(self.history) // 2))
-            recent = list(self.history)[-window_size:]
-            
-            # Déterminer la confiance selon le nombre d'échantillons
-            if window_size >= 15:
-                confidence = "high"
-            elif window_size >= 8:
-                confidence = "medium"
-            else:
-                confidence = "low"
-            
-            if len(recent) >= 2:
-                dt = recent[-1][0] - recent[0][0]  # Delta temps
-                dlevel = recent[-1][1] - recent[0][1]  # Delta niveau
-                
-                if dt > 0:
-                    rate = dlevel / dt  # %/s
-                    
-                    if charging:
-                        charge_rate = rate
-                        
-                        # Estimer temps de charge restant
-                        if rate > 0:
-                            remaining_percent = 100.0 - level
-                            time_remaining = remaining_percent / rate  # secondes
-                            
-                            # Déterminer qualité de charge
-                            charge_rate_per_hour = rate * 3600  # %/h
-                            if charge_rate_per_hour > 50:
-                                quality = "rapid"  # >50%/h
-                            elif charge_rate_per_hour > 20:
-                                quality = "fast"   # 20-50%/h
-                            elif charge_rate_per_hour > 5:
-                                quality = "normal" # 5-20%/h
-                            else:
-                                quality = "slow"   # <5%/h
-                    else:
-                        discharge_rate = -rate  # Positif pour décharge
-                        
-                        # Estimer temps de décharge restant
-                        if rate < 0:
-                            time_remaining = level / abs(rate)  # secondes
-        
-        self.last_level = level
-        self.last_timestamp = timestamp
-        
-        return {
-            "level": level,
-            "charging": charging,
-            "timestamp": timestamp,
-            "charge_rate": charge_rate,  # %/s
-            "discharge_rate": discharge_rate,  # %/s
-            "time_remaining": time_remaining,  # secondes (None si indéterminé)
-            "charge_quality": quality if charging else None,
-            "confidence": confidence,  # Niveau de confiance de l'estimation
-            "sample_count": len(self.history)  # Nombre d'échantillons utilisés
-        }
+# Constantes pour la gestion des capteurs
+BOOTSTRAP_LECTURES = 5
+SEUIL_LENTEUR = 3.0
+SEUIL_VARIABILITE = 0.5
+SEUIL_TIMEOUT_WARNING = 0.8
+FREQ_MIN_ABSOLUE = 0.1
+EXCEPTIONS_CONSECUTIVES_MAX = 3
+FACTEUR_TIMEOUT_NORMAL = 1.5
+FACTEUR_TIMEOUT_INSTABLE = 2.5
+
+# Fichier d'override
+OVERRIDE_FILE = "capteurs_override.json"
+
+# Topic santé (diagnostic)
+HEALTH_TOPIC = "soma/health"
+HEALTH_FREQ = 1.0  # 1 Hz
+
+# Noms des zones pour les logs
+ZONE_NAMES = {
+    'lt_plateau': '❄️ CRITIQUE FROID',
+    'lt_exp2': '🥶 Froid extrême',
+    'lt_exp1': '😨 Froid modéré',
+    'lt_log': '😐 Froid léger',
+    'comfort': '😊 Confort',
+    'gt_log': '😐 Chaud léger',
+    'gt_exp1': '😓 Chaud modéré',
+    'gt_exp2': '🥵 Chaud extrême',
+    'gt_plateau': '🔥 CRITIQUE CHAUD'
+}
 
 @dataclass
 class SamplingProfile:
     name: str
     frequency: float
     description: str = ""
+
+@dataclass
+class CapteurConfig:
+    """Configuration dynamique d'un capteur"""
+    nom: str
+    nerf_alias: str
+    profil_origine: str
+    freq_cible: float
+    freq_effective: float
+    periode_effective: float
+    temps_lecture_max: float
+    temps_lecture_moyen: float
+    variabilite: float
+    timeout: float
+    seuil_max: float
+    seuil_min: Optional[float] = None
+    degrade: bool = False
+    instable: bool = False
+    suspendu: bool = False
+    en_douleur: bool = False
+    exceptions_consecutives: int = 0
+    raison_suspension: str = ""
+    override: bool = False
+
+@dataclass
+class ProfilAcquisition:
+    """Profil d'acquisition avec sa liste de capteurs"""
+    nom: str
+    freq_cible: float
+    capteurs: List[str] = field(default_factory=list)
+    freq_effective: float = 0.0
+    temps_max: float = 0.0
+
+@dataclass
+class Zone:
+    """Représente une zone de la courbe d'accélération"""
+    name: str
+    start: float
+    end: float
+    curve_type: str
+    f_start: float
+    f_end: float
+    metric_name: str = ""
+    
+    def contains(self, value: float) -> bool:
+        if self.curve_type == 'comfort':
+            return self.start <= value <= self.end
+        elif 'lt' in self.name:
+            if self.name == 'lt_log':
+                return value > self.end
+            elif self.name == 'lt_exp1':
+                return self.end < value <= self.start
+            elif self.name == 'lt_exp2':
+                return self.end < value <= self.start
+            elif self.name == 'lt_plateau':
+                return value <= self.start
+        else:
+            if self.name == 'gt_log':
+                return 0 <= value < self.end
+            elif self.name in ['gt_exp1', 'gt_exp2']:
+                return self.start <= value < self.end
+            elif self.name == 'gt_plateau':
+                return value >= self.start
+        return False
+    
+    def compute_frequency(self, value: float) -> float:
+        if self.curve_type == 'plateau' or self.curve_type == 'comfort':
+            return self.f_start
+        
+        if 'lt' in self.name:
+            if self.name == 'lt_log':
+                pos = 1.0
+            elif self.name == 'lt_exp1':
+                pos = (self.start - value) / (self.start - self.end)
+            elif self.name == 'lt_exp2':
+                pos = (self.start - value) / (self.start - self.end)
+            else:
+                pos = 1.0
+        else:
+            if self.name == 'gt_log':
+                pos = value / self.end
+            else:
+                pos = (value - self.start) / (self.end - self.start)
+        
+        pos = max(0.0, min(1.0, pos))
+        
+        if self.curve_type == 'log':
+            if pos <= 0:
+                return self.f_start
+            return self.f_start + math.log1p(pos) / math.log(2) * (self.f_end - self.f_start)
+        
+        elif self.curve_type == 'exp':
+            if pos <= 0:
+                return self.f_start
+            return self.f_start + (math.exp(pos) - 1) / (math.e - 1) * (self.f_end - self.f_start)
+        
+        elif self.curve_type == 'exp_aggressive':
+            if pos <= 0:
+                return self.f_start
+            aggro_factor = 2.5
+            exp_factor = math.exp(aggro_factor) - 1
+            return self.f_start + (math.exp(pos * aggro_factor) - 1) / exp_factor * (self.f_end - self.f_start)
+        
+        return self.f_start
 
 @dataclass
 class AlertRule:
@@ -160,26 +195,155 @@ class AlertRule:
     output_freq_min: float = FREQ_MIN
     output_freq_max: float = FREQ_MAX
     absolute_delta_threshold: float = 0.0
-    mixing_coefficients: Optional[Dict[str, float]] = None  # Pour ego
-    normalization: str = "weighted_rms"  # "weighted_rms", "max", "mean"
+    aggro_factor: float = 2.5
+
+class BatteryMonitor:
+    """Moniteur de batterie avec estimation en minutes"""
+    def __init__(self, battery_capacity_wh: float = 50.0):
+        self.battery_capacity_wh = battery_capacity_wh
+        self.history = collections.deque(maxlen=60)
+        self.last_level = None
+        self.last_timestamp = None
+        
+    def update(self, level: float, charging: bool, timestamp: float) -> Dict:
+        self.history.append((timestamp, level, charging))
+        
+        result = {
+            "level": round(level, 1),
+            "charging": charging,
+            "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "charge_rate": 0.0,
+            "discharge_rate": 0.0,
+            "minutes_to_full": None,
+            "minutes_to_empty": None,
+            "confidence": "low"
+        }
+        
+        if len(self.history) < 2:
+            return result
+        
+        window_size = min(len(self.history), max(5, len(self.history) // 3))
+        recent = list(self.history)[-window_size:]
+        
+        if window_size >= 30:
+            result["confidence"] = "high"
+        elif window_size >= 15:
+            result["confidence"] = "medium"
+        
+        if len(recent) >= 2:
+            dt = recent[-1][0] - recent[0][0]
+            if dt > 0:
+                dlevel = recent[-1][1] - recent[0][1]
+                rate_per_second = dlevel / dt
+                rate_per_minute = rate_per_second * 60
+                
+                if charging and rate_per_second > 0:
+                    result["charge_rate"] = round(rate_per_minute, 2)
+                    remaining_to_full = 100.0 - level
+                    if rate_per_second > 0:
+                        minutes_to_full = remaining_to_full / rate_per_minute
+                        result["minutes_to_full"] = round(minutes_to_full, 1)
+                
+                elif not charging and rate_per_second < 0:
+                    result["discharge_rate"] = round(abs(rate_per_minute), 2)
+                    if rate_per_second < 0:
+                        minutes_to_empty = level / abs(rate_per_minute)
+                        result["minutes_to_empty"] = round(minutes_to_empty, 1)
+        
+        self.last_level = level
+        self.last_timestamp = timestamp
+        return result
+    
+    def reset(self):
+        self.history.clear()
+        self.last_level = None
+        self.last_timestamp = None
+        logger.debug("BatteryMonitor réinitialisé")
+
+class FrequencyMapper:
+    """Mappe les valeurs vers des fréquences selon une courbe d'accélération"""
+    def __init__(self, rule: AlertRule):
+        self.rule = rule
+        self.f_min = rule.output_freq_min
+        self.f_max = rule.output_freq_max
+        self.f_low = self.f_min + (self.f_max - self.f_min) / 3
+        self.f_mid = self.f_min + 2 * (self.f_max - self.f_min) / 3
+        
+        self.zones: List[Zone] = []
+        self._build_zones()
+        self._cache: Dict[float, Tuple[float, str]] = {}
+        
+        logger.debug(f"📊 Mapper créé pour {rule.name}: {len(self.zones)} zones")
+    
+    def _build_zones(self):
+        rule = self.rule
+        comfort_start = float('-inf')
+        comfort_end = float('inf')
+        
+        if rule.gt and len(rule.gt) >= 3:
+            s1, s2, s3 = rule.gt
+            if not (s1 < s2 < s3):
+                s1, s2, s3 = sorted(rule.gt)
+            
+            if s1 > 0:
+                self.zones.append(Zone("gt_log", 0.0, s1, "log", self.f_min, self.f_low, rule.name))
+            self.zones.append(Zone("gt_exp1", s1, s2, "exp", self.f_low, self.f_mid, rule.name))
+            self.zones.append(Zone("gt_exp2", s2, s3, "exp_aggressive", self.f_mid, self.f_max, rule.name))
+            self.zones.append(Zone("gt_plateau", s3, float('inf'), "plateau", self.f_max, self.f_max, rule.name))
+            comfort_end = s1
+        
+        if rule.lt and len(rule.lt) >= 3:
+            l3, l2, l1 = rule.lt
+            if not (l3 > l2 > l1):
+                l3, l2, l1 = sorted(rule.lt, reverse=True)
+            
+            self.zones.append(Zone("lt_plateau", l1, float('-inf'), "plateau", self.f_max, self.f_max, rule.name))
+            self.zones.append(Zone("lt_exp2", l2, l1, "exp_aggressive", self.f_mid, self.f_max, rule.name))
+            self.zones.append(Zone("lt_exp1", l3, l2, "exp", self.f_low, self.f_mid, rule.name))
+            self.zones.append(Zone("lt_log", float('inf'), l3, "log", self.f_min, self.f_low, rule.name))
+            comfort_start = l3
+        
+        if comfort_start != float('-inf') or comfort_end != float('inf'):
+            self.zones.append(Zone("comfort", comfort_start, comfort_end, "comfort", self.f_min, self.f_min, rule.name))
+    
+    def get_frequency(self, value: float) -> Tuple[float, str]:
+        rounded_val = round(value, PRECISION_DECIMALES)
+        if rounded_val in self._cache:
+            return self._cache[rounded_val]
+        
+        for zone in self.zones:
+            if zone.contains(value):
+                freq = round(zone.compute_frequency(value), 3)
+                self._cache[rounded_val] = (freq, zone.name)
+                return freq, zone.name
+        
+        return self.f_min, "unknown"
+    
+    def get_period_ms(self, value: float) -> Tuple[float, str]:
+        freq, zone_name = self.get_frequency(value)
+        period_ms = 1000.0 / freq if freq > 0 else 1000.0
+        rounded_ms = max(10, round(period_ms / 10) * 10)
+        return rounded_ms / 1000.0, zone_name
+    
+    def reset(self):
+        self._cache.clear()
+        logger.debug(f"FrequencyMapper pour {self.rule.name} réinitialisé")
 
 class MetricCollector:
-    """Collecteur de métriques de base"""
-    def __init__(self):
+    def __init__(self, nom: str):
+        self.nom = nom
         self.supported_metrics = set()
     
     def can_collect(self, metric_name: str) -> bool:
-        """Vérifie si ce collecteur peut collecter cette métrique"""
         return metric_name in self.supported_metrics
     
     def collect(self, metric_names: List[str]) -> Dict[str, float]:
-        """Collecte uniquement les métriques demandées"""
         return {}
 
 class SystemMetricCollector(MetricCollector):
     def __init__(self):
-        super().__init__()
-        self.supported_metrics = {"cpu", "memory", "temperature", "energy", "energy_charging", "energy_discharge"}
+        super().__init__("system")
+        self.supported_metrics = {"cpu", "memory", "temperature", "energy"}
         self._wmi_interface = None
         if IF_WINDOWS:
             try:
@@ -189,9 +353,8 @@ class SystemMetricCollector(MetricCollector):
                 pass
     
     def _get_temperature(self) -> float:
-        """Récupère la température système (multiplateforme)."""
         if IF_WINDOWS and self._wmi_interface:
-            try:  # Windows WMI fallback
+            try:
                 cmd = "Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature | Select-Object -ExpandProperty CurrentTemperature"
                 output = subprocess.check_output(
                     ["powershell", "-Command", cmd],
@@ -210,55 +373,38 @@ class SystemMetricCollector(MetricCollector):
                     return list(temps.values())[0][0].current
             except Exception:
                 pass
-        return 0.0
+        return 20.0
     
     def collect(self, metric_names: List[str]) -> Dict[str, float]:
-        """Collecte uniquement les métriques système demandées"""
         metrics = {}
         
-        # CPU
         if "cpu" in metric_names:
             metrics["cpu"] = psutil.cpu_percent(interval=None)
         
-        # Memory
         if "memory" in metric_names:
             metrics["memory"] = psutil.virtual_memory().percent
         
-        # Température
         if "temperature" in metric_names:
-            temp = self._get_temperature()            
-            metrics["temperature"] = temp
+            metrics["temperature"] = self._get_temperature()
         
-        # Batterie (collectée même si pas demandée pour l'état charging)
-        if "energy" in metric_names or "energy_charging" in metric_names or "energy_discharge" in metric_names:
+        if "energy" in metric_names:
             try:
                 battery = psutil.sensors_battery()
                 if battery:
-                    if "energy" in metric_names:
-                        metrics["energy"] = battery.percent
-                    metrics["energy_charging"] = battery.power_plugged
-                    
-                    # ✅ NOUVEAU : energy_discharge = taux de décharge
-                    # Métrique virtuelle calculée depuis energy
-                    if "energy_discharge" in metric_names:
-                        # energy_discharge représente la "pression" de décharge
-                        # C'est l'inverse du niveau de batterie
-                        # Plus la batterie est basse, plus le stress est élevé
-                        discharge_pressure = 100.0 - battery.percent
-                        metrics["energy_discharge"] = discharge_pressure
+                    metrics["energy"] = battery.percent
+                    metrics["_energy_charging"] = battery.power_plugged
+                else:
+                    metrics["energy"] = 100.0
+                    metrics["_energy_charging"] = False
             except:
-                metrics["energy_charging"] = False
-                if "energy" in metric_names:
-                    metrics["energy"] = 0.0
-                if "energy_discharge" in metric_names:
-                    metrics["energy_discharge"] = 100.0  # Max stress si pas de batterie
-            
-        logger.debug(f"System metrics : {metrics}")
+                metrics["energy"] = 100.0
+                metrics["_energy_charging"] = False
+        
         return metrics
 
 class IMUMetricCollector(MetricCollector):
     def __init__(self):
-        super().__init__()
+        super().__init__("imu")
         self.supported_metrics = {
             "imu_pitch_forward", "imu_pitch_backward",
             "imu_roll_left", "imu_roll_right",
@@ -267,281 +413,169 @@ class IMUMetricCollector(MetricCollector):
         }
 
     def collect(self, metric_names: List[str]) -> Dict[str, float]:
-        """Collecte uniquement les métriques IMU demandées"""
         metrics = {}
-        
-        # TODO: Implémenter la vraie lecture IMU
-        # Pour l'instant, retourne 0 pour toutes les métriques demandées
         for name in metric_names:
             if name in self.supported_metrics:
                 metrics[name] = 0.0
-        
         return metrics
 
 class MetricNerve:
-    def __init__(self, rule: AlertRule):
+    def __init__(self, rule: AlertRule, battery_monitor: Optional[BatteryMonitor] = None):
         self.rule = rule
+        self.battery_monitor = battery_monitor
         self.history = collections.deque(maxlen=WINDOW_SIZE)
         self.timestamps = collections.deque(maxlen=WINDOW_SIZE)
         self.last_published_value = None
         self.warmup_complete = False
         self.current_stress = 0.0
         self.current_period = PERIODE_VALIDITE
-        self._new_data_event = threading.Event()  # ✅ AJOUT : Signale nouvelle donnée
+        self.frequency_mapper = FrequencyMapper(rule)
+        self._new_data_event = threading.Event()
         self._lock = threading.Lock()
+        self.last_freq = rule.output_freq_min
+        self.last_zone = "unknown"
+        self.last_battery_info = None
 
-    def push(self, val: float, timestamp: float):
+    def push(self, val: float, timestamp: float, extra_data: Dict = None):
         with self._lock:
             self.history.append(val)
             self.timestamps.append(timestamp)
+            if extra_data:
+                self.last_battery_info = extra_data
             if not self.warmup_complete and len(self.history) >= WARMUP_SAMPLES:
                 self.warmup_complete = True
-            self._new_data_event.set()  # ✅ AJOUT : Signaler nouvelle donnée
+            self._new_data_event.set()
 
     def wait_for_data(self, timeout=1.0):
-        """Attend qu'une nouvelle donnée arrive"""
         return self._new_data_event.wait(timeout)
     
     def clear_event(self):
-        """Réinitialise l'event après traitement"""
         self._new_data_event.clear()
 
     def get_latest(self):
-        """Récupère la dernière valeur de manière thread-safe"""
         with self._lock:
             if len(self.history) > 0:
-                return self.history[-1], self.timestamps[-1]
-            return None, None
+                return self.history[-1], self.timestamps[-1], self.last_battery_info
+            return None, None, None
 
     def get_stress(self, val: float, charging: bool = False) -> float:
-        """Calcule le stress (0 si dans la plage valide, sinon [0,1])."""
         x = 0.0
         if self.rule.gt and len(self.rule.gt) >= 3 and val > self.rule.gt[0]:
             x = min(1.0, max(0.0, (val - self.rule.gt[0]) / (self.rule.gt[-1] - self.rule.gt[0])))
         elif self.rule.lt and len(self.rule.lt) >= 3 and val < self.rule.lt[0]:
-            # ✅ CORRECTION : Gestion charging pour energy
             if not (self.rule.name == "energy" and charging):
                 x = min(1.0, max(0.0, (self.rule.lt[0] - val) / (self.rule.lt[0] - self.rule.lt[-1])))
         self.current_stress = x
         return x
+    
+    def get_period_for_value(self, value: float) -> Tuple[float, str]:
+        return self.frequency_mapper.get_period_ms(value)
+    
+    def reset(self):
+        with self._lock:
+            self.history.clear()
+            self.timestamps.clear()
+            self.warmup_complete = False
+            self.current_stress = 0.0
+            self.current_period = PERIODE_VALIDITE
+            self.last_battery_info = None
+            self.frequency_mapper.reset()
+            self._new_data_event.clear()
+        logger.debug(f"Nerf {self.rule.name} réinitialisé")
 
-def freq_from_value_gt(value: float, seuils: List[float], f_base: float = FREQ_MIN, f_max: float = FREQ_MAX) -> float:
-    """Calcule la fréquence pour un seuil GT (logarithmique puis exponentiel)."""
-    if len(seuils) < 3:
-        return f_base
-    s1, s2, s3 = seuils
-    if value <= s1:
-        return f_base
-    elif value <= s2:
-        ratio = (value - s1) / (s2 - s1)
-        freq = f_base + math.log1p(ratio) / math.log1p(1.0) * (f_max/2 - f_base)
-        return freq
-    elif value <= s3:
-        ratio = (value - s2) / (s3 - s2)
-        freq = f_max/2 + (math.exp(ratio) - 1) / (math.e - 1) * (f_max/2)
-        return freq
-    else:
-        return f_max
-
-def freq_from_value_lt(value: float, seuils: List[float], f_base: float = FREQ_MIN, f_max: float = FREQ_MAX) -> float:
-    """Calcule la fréquence pour un seuil LT (logarithmique puis exponentiel)."""
-    if len(seuils) < 3:
-        return f_base
-    # ✅ CORRECTION: seuils LT dans l'ordre décroissant [l3, l2, l1]
-    l3, l2, l1 = seuils
-    if value >= l3:
-        return f_base
-    elif value >= l2:
-        ratio = (l3 - value) / (l3 - l2)
-        freq = f_base + math.log1p(ratio) / math.log1p(1.0) * (f_max/2 - f_base)
-        return freq
-    elif value >= l1:
-        ratio = (l2 - value) / (l2 - l1)
-        freq = f_max/2 + (math.exp(ratio) - 1) / (math.e - 1) * (f_max/2)
-        return freq
-    else:
-        return f_max
-
-def freq_from_value_unified(value: float, 
-                           seuils_gt: Optional[List[float]], 
-                           seuils_lt: Optional[List[float]], 
-                           f_base: float = FREQ_MIN, 
-                           f_max: float = FREQ_MAX) -> float:
-    """
-    Calcule la fréquence sur une courbe unifiée pour métriques avec GT ET LT.
+class HealthMonitor:
+    """Moniteur de santé publiant sur /soma/health à 1 Hz"""
     
-    Cas d'usage typique: TEMPÉRATURE
-    - LT [10, 5, 0] : Froid critique → fréquence monte
-    - Zone confort [10-45°C] : fréquence basse (f_base)
-    - GT [45, 65, 80] : Chaud critique → fréquence monte
-    
-    Résultat: Courbe en "U" 
-    
-    Args:
-        value: Valeur actuelle
-        seuils_gt: [s1, s2, s3] dans l'ordre CROISSANT où value > s1 active GT
-        seuils_lt: [l3, l2, l1] dans l'ordre DÉCROISSANT où value < l3 active LT
-        f_base: Fréquence de base (zone confort)
-        f_max: Fréquence maximale (zones critiques)
-    
-    Returns:
-        Fréquence calculée (f_base à f_max)
-    """
-    # Si seulement GT ou seulement LT, utiliser fonction classique
-    if seuils_gt and not seuils_lt:
-        return freq_from_value_gt(value, seuils_gt, f_base, f_max)
-    if seuils_lt and not seuils_gt:
-        return freq_from_value_lt(value, seuils_lt, f_base, f_max)
-    
-    # Cas unifié: GT ET LT
-    if not seuils_gt or len(seuils_gt) < 3:
-        return f_base
-    if not seuils_lt or len(seuils_lt) < 3:
-        return f_base
-    
-    gt_s1, gt_s2, gt_s3 = seuils_gt  # Ordre croissant: [45, 65, 80]
-    lt_l3, lt_l2, lt_l1 = seuils_lt  # ✅ Ordre décroissant: [10, 5, 0]
-    
-    # Zone GT (chaud pour température)
-    if value >= gt_s1:
-        if value <= gt_s2:
-            ratio = (value - gt_s1) / (gt_s2 - gt_s1)
-            freq = f_base + math.log1p(ratio) / math.log1p(1.0) * (f_max/2 - f_base)
-            return freq
-        elif value <= gt_s3:
-            ratio = (value - gt_s2) / (gt_s3 - gt_s2)
-            freq = f_max/2 + (math.exp(ratio) - 1) / (math.e - 1) * (f_max/2)
-            return freq
-        else:
-            return f_max
-    
-    # Zone LT (froid pour température)
-    elif value <= lt_l3:
-        if value >= lt_l2:
-            ratio = (lt_l3 - value) / (lt_l3 - lt_l2)
-            freq = f_base + math.log1p(ratio) / math.log1p(1.0) * (f_max/2 - f_base)
-            return freq
-        elif value >= lt_l1:
-            ratio = (lt_l2 - value) / (lt_l2 - lt_l1)
-            freq = f_max/2 + (math.exp(ratio) - 1) / (math.e - 1) * (f_max/2)
-            return freq
-        else:
-            return f_max
-    
-    # Zone confort (entre LT et GT)
-    else:
-        return f_base
-
-def freq_from_value_lt_battery(value: float, 
-                               seuils: List[float], 
-                               f_base: float = 1.0,  # ← Même paramètre que GT
-                               f_max: float = FREQ_MAX) -> float:
-    """
-    Calcule la fréquence pour batterie (LT) avec la MÊME courbe que GT.
-    
-    IDENTIQUE à freq_from_value_gt, juste inversée pour LT.
-    
-    Args:
-        value: Niveau batterie (%)
-        seuils: [l3, l2, l1] dans l'ordre DÉCROISSANT (ex: [60, 30, 15])
-        f_base: Fréquence de base (1 Hz pour batterie)
-        f_max: Fréquence maximale
-    
-    Returns:
-        Fréquence dans [f_base, f_max]
-    
-    Exemple avec seuils = [60, 30, 15], f_base=1.0, f_max=10.0:
-        battery ≥ 60% → freq = 1.0 Hz (f_base)
-        battery = 45% → freq ≈ 3.5 Hz (zone log)
-        battery = 20% → freq ≈ 7 Hz (zone exp)
-        battery ≤ 15% → freq = 10 Hz (f_max)
-    """
-    if len(seuils) < 3:
-        return f_base
-    
-    # ✅ CORRECTION: seuils LT sont dans l'ordre décroissant
-    l3, l2, l1 = seuils  # [60, 30, 15] → l3=60, l2=30, l1=15
-    
-    if value >= l3:
-        # Au-dessus du seuil haut (≥60%) → fréquence de base
-        return f_base
-    elif value >= l2:
-        # Zone log: 60% → 30% (progression douce)
-        ratio = (l3 - value) / (l3 - l2)
-        freq = f_base + math.log1p(ratio) / math.log1p(1.0) * (f_max/2 - f_base)
-        return freq
-    elif value >= l1:
-        # Zone exp: 30% → 15% (progression agressive)
-        ratio = (l2 - value) / (l2 - l1)
-        freq = f_max/2 + (math.exp(ratio) - 1) / (math.e - 1) * (f_max/2)
-        return freq
-    else:
-        # En-dessous du seuil bas (<15%) → fréquence max
-        return f_max
-
-class PulseGenerator(threading.Thread):
-    def __init__(self, rule: AlertRule, session: zenoh.Session):
-        super().__init__(daemon=True)
-        self.rule = rule
-        self.pub = session.declare_publisher(rule.flux_topic)
-        self.target_period = 1.0 / rule.output_freq_min
-        self.payload = None
+    def __init__(self, session: zenoh.Session, capteurs_config: Dict[str, CapteurConfig]):
+        self.session = session
+        self.capteurs_config = capteurs_config
+        self.pub = session.declare_publisher(HEALTH_TOPIC)
         self.running = True
         self._lock = threading.Lock()
-
-    def update(self, period: float, msg: Optional[str]):
-        with self._lock:
-            self.target_period = period
-            self.payload = msg
-
-    def run(self):
+        
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        logger.info("✅ HealthMonitor démarré (1 Hz)")
+        
+    def _run(self):
         while self.running:
-            with self._lock:
-                p, msg = self.target_period, self.payload
-            if msg:
-                try:
-                    self.pub.put(msg)
-                    time.sleep(max(0.001, p))
-                except Exception as e:
-                    logger.error(f"Erreur publication pour {self.rule.name}: {e}")
-                    time.sleep(1.0)
-            else:
-                void_payload = json.dumps({"state": "void", "ts": datetime.now(timezone.utc).isoformat()})
-                try:
-                    self.pub.put(void_payload)
-                except Exception as e:
-                    logger.error(f"Erreur publication void pour {self.rule.name}: {e}")
-                time.sleep(LIFE_NOISE_PERIOD)
-
+            try:
+                rapport = self._generer_rapport()
+                self.pub.put(json.dumps(rapport))
+            except Exception as e:
+                logger.error(f"Erreur HealthMonitor: {e}")
+            time.sleep(1.0 / HEALTH_FREQ)
+    
+    def _generer_rapport(self) -> Dict:
+        with self._lock:
+            rapport = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "capteurs": {}
+            }
+            
+            for nom, cfg in self.capteurs_config.items():
+                etat = "OK"
+                if cfg.en_douleur:
+                    etat = "DOULEUR"
+                elif cfg.suspendu:
+                    etat = "SUSPENDU"
+                elif cfg.degrade:
+                    etat = "DEGRADE"
+                elif cfg.instable:
+                    etat = "INSTABLE"
+                
+                rapport["capteurs"][nom] = {
+                    "etat": etat,
+                    "freq_effective": round(cfg.freq_effective, 2),
+                    "temps_max_ms": round(cfg.temps_lecture_max * 1000, 1),
+                    "variabilite": round(cfg.variabilite, 2),
+                    "raison": cfg.raison_suspension if cfg.suspendu else ""
+                }
+            
+            # Statistiques globales
+            total = len(self.capteurs_config)
+            douleur = sum(1 for c in self.capteurs_config.values() if c.en_douleur)
+            suspendus = sum(1 for c in self.capteurs_config.values() if c.suspendu)
+            degrades = sum(1 for c in self.capteurs_config.values() if c.degrade)
+            
+            rapport["global"] = {
+                "total": total,
+                "douleur": douleur,
+                "suspendus": suspendus,
+                "degrades": degrades,
+                "sante": round((total - douleur - suspendus) / total * 100, 1) if total > 0 else 100
+            }
+            
+            return rapport
+    
     def stop(self):
         self.running = False
 
 class SomaCore:
     def __init__(self, zenoh_config: str, config_path: str):
         self.running = True
+        self.zenoh_config = zenoh_config
+        self.config_path = config_path
+        
+        # Structure pour les profils et capteurs
+        self.profils: Dict[str, ProfilAcquisition] = {}
+        self.capteurs_config: Dict[str, CapteurConfig] = {}
+        self.capteurs_actifs: List[str] = []
+        
+        # Charger les overrides existants
+        self.overrides = self._charger_overrides()
         
         # Initialisation Zenoh
-        self.conf = zenoh.Config()
-        self.zenohCfgFile = zenoh_config
-        self.conf.from_file(self.zenohCfgFile)
-        self.session = zenoh.open(self.conf)
-
-        self.pub_charging = self.session.declare_publisher("energy/charging")
-
+        self._init_zenoh()
+        
         self._clock_lock = threading.Lock()
         self._salve_times = []
         self._phase_sync_event = threading.Event()
-        self._charging = False  # État charging
-        self._last_charging = False  # Pour détecter changement
-        self._temperature = 0.0  # Température courante
-        self._temp_critical = False  # État critique température
+        self._charging = False
+        self._last_charging = False
+        self._temperature = 20.0
         
-        # ✅ NOUVEAU : Moniteur de batterie
-        self._battery_monitor = BatteryMonitor(battery_capacity_wh=50.0)  # Ajuster selon batterie réelle
-        
-        # ✅ NOUVEAU : Events spéciaux
-        self._charging_changed_event = threading.Event()
-        self._temp_critical_event = threading.Event()
+        self._battery_monitor = BatteryMonitor()
 
         # Charger la configuration
         with open(config_path, "r") as f:
@@ -553,11 +587,17 @@ class SomaCore:
             for name, profile_data in config["sampling_profiles"].items()
         }
         self.default_sampling_profile = config["default_sampling_profile"]
-        logger.info(f"📊 Profils d'échantillonnage: {list(self.sampling_profiles.keys())}")
+        logger.info(f"📊 Profils: {list(self.sampling_profiles.keys())}")
 
         # Créer les AlertRule
         self.rules = []
         for metric_name, metric_config in config["metrics"].items():
+            if metric_name == "ego":
+                continue
+                
+            if "output_freq_min" in metric_config:
+                metric_config["output_freq_min"] = max(1.0, metric_config["output_freq_min"])
+            
             rule = AlertRule(
                 name=metric_name,
                 alias=metric_config["alias"],
@@ -568,51 +608,31 @@ class SomaCore:
                 output_freq_min=metric_config.get("output_freq_min", FREQ_MIN),
                 output_freq_max=metric_config.get("output_freq_max", FREQ_MAX),
                 absolute_delta_threshold=metric_config.get("absolute_delta_threshold", 0.0),
-                mixing_coefficients=metric_config.get("mixing_coefficients"),
-                normalization=metric_config.get("normalization", "weighted_rms")
+                aggro_factor=metric_config.get("aggro_factor", 2.5)
             )
             self.rules.append(rule)
-            logger.debug(f"Règle créée: {metric_name} (profil={rule.sampling_profile})")
+            logger.debug(f"Règle: {metric_name} (profil={rule.sampling_profile})")
 
         # Initialiser les collecteurs
         self.collectors = [SystemMetricCollector(), IMUMetricCollector()]
 
-        # Créer les nerfs et générateurs (sauf ego)
-        self.nerves = {r.name: MetricNerve(r) for r in self.rules if r.name != "ego"}
-        self.generators = {r.name: PulseGenerator(r, self.session) for r in self.rules if r.name != "ego"}
+        # Initialiser le scheduler et les nerfs
+        self._init_scheduler_and_nerves()
+        
+        # Lancer le bootstrap des capteurs
+        self._bootstrap_capteurs()
+        
+        # Démarrer le HealthMonitor
+        self.health_monitor = HealthMonitor(self.session, self.capteurs_config)
+        self.health_monitor.start()
+        
+        # S'abonner au topic de reset
+        self._subscribe_to_reset()
 
-        # Démarrer les générateurs
-        for gen in self.generators.values():
-            gen.start()
+        # Démarrer les threads d'acquisition
+        self._demarrer_acquisition()
 
-        # Gérer le nerf ego séparément
-        ego_rule = next((r for r in self.rules if r.name == "ego"), None)
-        self.ego_nerve = MetricNerve(ego_rule) if ego_rule else None
-        self.ego_gen = PulseGenerator(ego_rule, self.session) if ego_rule else None
-        if self.ego_gen:
-            self.ego_gen.start()
-
-        # Regrouper les métriques par profil
-        self.metrics_by_profile = {}
-        for rule in self.rules:
-            if rule.name == "ego":
-                continue
-            profile_name = rule.sampling_profile
-            if profile_name not in self.metrics_by_profile:
-                self.metrics_by_profile[profile_name] = []
-            self.metrics_by_profile[profile_name].append(rule.name)
-
-        # ✅ CORRECTION : Démarrer 1 thread d'acquisition par profil
-        for profile_name, metric_names in self.metrics_by_profile.items():
-            profile = self.sampling_profiles[profile_name]
-            logger.info(f"🔄 Thread acquisition [{profile_name}]: {metric_names} @ {profile.frequency}Hz")
-            threading.Thread(
-                target=self._sampling_loop,
-                args=(profile.frequency, metric_names),
-                daemon=True
-            ).start()
-
-        # ✅ CORRECTION : Démarrer 1 thread de traitement par nerf (TOUS les profils)
+        # Démarrer les threads de traitement
         for metric_name in self.nerves.keys():
             threading.Thread(
                 target=self._nerve_process_loop,
@@ -620,329 +640,550 @@ class SomaCore:
                 daemon=True
             ).start()
 
-        # ✅ CORRECTION : Démarrer le thread ego
-        if self.ego_gen:
-            threading.Thread(target=self._ego_process_loop, daemon=True).start()
-            logger.info("🧠 Thread ego démarré")
-
-        logger.info("⏳ Phase d'éveil...")
+        logger.info("⏳ Warmup...")
         self._warmup_phase()
         
-        
         signal.signal(signal.SIGINT, lambda s, f: self.stop())
+    
+    def _charger_overrides(self) -> Dict:
+        try:
+            if os.path.exists(OVERRIDE_FILE):
+                with open(OVERRIDE_FILE, 'r') as f:
+                    overrides = json.load(f)
+                logger.info(f"📁 Overrides chargés: {len(overrides)} capteurs")
+                return overrides
+        except Exception as e:
+            logger.error(f"Erreur chargement overrides: {e}")
+        return {}
+    
+    def _sauvegarder_overrides(self):
+        try:
+            with open(OVERRIDE_FILE, 'w') as f:
+                json.dump(self.overrides, f, indent=2)
+            logger.debug("📁 Overrides sauvegardés")
+        except Exception as e:
+            logger.error(f"Erreur sauvegarde overrides: {e}")
+    
+    def _calculer_seuil_max(self, rule: AlertRule) -> float:
+        """Calcule la valeur maximale de seuil (la plus critique)"""
+        if rule.gt:
+            return rule.gt[-1]
+        elif rule.lt:
+            return rule.lt[-1]
+        return 1.0
+    
+    def _calculer_seuil_min(self, rule: AlertRule) -> Optional[float]:
+        """Calcule la valeur minimale de seuil (la plus critique pour LT)"""
+        if rule.lt:
+            return rule.lt[0]
+        return None
+    
+    def _bootstrap_capteurs(self):
+        logger.info("🔧 Démarrage du bootstrap des capteurs...")
+        
+        # Étape 1 : Regrouper les capteurs par profil d'origine
+        capteurs_par_profil = {}
+        for rule in self.rules:
+            profil = rule.sampling_profile
+            if profil not in capteurs_par_profil:
+                capteurs_par_profil[profil] = []
+            capteurs_par_profil[profil].append((rule.name, rule))
+        
+        # Étape 2 : Pour chaque profil, mesurer les temps des capteurs
+        for nom_profil, capteurs in capteurs_par_profil.items():
+            profil_config = self.sampling_profiles[nom_profil]
+            freq_cible = profil_config.frequency
+            periode_cible = 1.0 / freq_cible
+            
+            logger.info(f"📊 Bootstrap du profil {nom_profil} ({freq_cible} Hz)")
+            
+            temps_par_capteur = {}
+            for capteur_nom, rule in capteurs:
+                collecteur = next((c for c in self.collectors if c.can_collect(capteur_nom)), None)
+                if not collecteur:
+                    logger.warning(f"⚠️ Aucun collecteur pour {capteur_nom}")
+                    continue
+                
+                temps_lectures = []
+                try:
+                    for i in range(BOOTSTRAP_LECTURES):
+                        debut = time.perf_counter()
+                        val = collecteur.collect([capteur_nom]).get(capteur_nom, 0.0)
+                        duree = time.perf_counter() - debut
+                        temps_lectures.append(duree)
+                        time.sleep(periode_cible * 0.1)
+                    
+                    t_min = min(temps_lectures)
+                    t_max = max(temps_lectures)
+                    t_moyen = sum(temps_lectures) / len(temps_lectures)
+                    variabilite = (t_max - t_min) / t_moyen if t_moyen > 0 else 0
+                    
+                    temps_par_capteur[capteur_nom] = {
+                        'min': t_min,
+                        'max': t_max,
+                        'moyen': t_moyen,
+                        'variabilite': variabilite,
+                        'lectures': temps_lectures,
+                        'rule': rule
+                    }
+                    
+                    logger.debug(f"  {capteur_nom}: min={t_min*1000:.2f}ms, "
+                               f"max={t_max*1000:.2f}ms, "
+                               f"var={variabilite:.2f}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erreur bootstrap {capteur_nom}: {e}")
+                    self._gerer_exception_capteur(capteur_nom, str(e))
+            
+            if not temps_par_capteur:
+                continue
+            
+            temps_max_liste = [t['max'] for t in temps_par_capteur.values()]
+            mediane_max = statistics.median(temps_max_liste) if temps_max_liste else 0
+            
+            for capteur_nom, stats in temps_par_capteur.items():
+                rule = stats['rule']
+                t_max = stats['max']
+                variabilite = stats['variabilite']
+                
+                if capteur_nom in self.overrides:
+                    logger.info(f"  ↪ {capteur_nom} utilise override: {self.overrides[capteur_nom]}")
+                    continue
+                
+                est_lent = t_max > mediane_max * SEUIL_LENTEUR
+                est_instable = variabilite > SEUIL_VARIABILITE
+                
+                freq_max_possible = 1.0 / t_max if t_max > 0 else freq_cible
+                
+                if est_lent or est_instable:
+                    facteur_timeout = FACTEUR_TIMEOUT_INSTABLE if est_instable else FACTEUR_TIMEOUT_NORMAL
+                    timeout = t_max * facteur_timeout
+                    
+                    freq_effective = min(freq_cible, freq_max_possible)
+                    if freq_effective < FREQ_MIN_ABSOLUE:
+                        freq_effective = FREQ_MIN_ABSOLUE
+                        logger.warning(f"⚠️ {capteur_nom} fréquence très basse: {freq_effective} Hz")
+                    
+                    self.capteurs_config[capteur_nom] = CapteurConfig(
+                        nom=capteur_nom,
+                        nerf_alias=rule.alias,
+                        profil_origine=nom_profil,
+                        freq_cible=freq_cible,
+                        freq_effective=freq_effective,
+                        periode_effective=1.0/freq_effective,
+                        temps_lecture_max=t_max,
+                        temps_lecture_moyen=stats['moyen'],
+                        variabilite=variabilite,
+                        timeout=timeout,
+                        seuil_max=self._calculer_seuil_max(rule),
+                        seuil_min=self._calculer_seuil_min(rule),
+                        degrade=est_lent,
+                        instable=est_instable
+                    )
+                    
+                    logger.warning(f"⚠️ Capteur {capteur_nom}: lent={est_lent}, instable={est_instable}")
+                    logger.info(f"   → Profil dédié à {freq_effective:.2f} Hz")
+                    
+                else:
+                    self.capteurs_config[capteur_nom] = CapteurConfig(
+                        nom=capteur_nom,
+                        nerf_alias=rule.alias,
+                        profil_origine=nom_profil,
+                        freq_cible=freq_cible,
+                        freq_effective=freq_cible,
+                        periode_effective=1.0/freq_cible,
+                        temps_lecture_max=t_max,
+                        temps_lecture_moyen=stats['moyen'],
+                        variabilite=variabilite,
+                        timeout=t_max * FACTEUR_TIMEOUT_NORMAL,
+                        seuil_max=self._calculer_seuil_max(rule),
+                        seuil_min=self._calculer_seuil_min(rule)
+                    )
+        
+        self.capteurs_actifs = list(self.capteurs_config.keys())
+        logger.info(f"✅ Bootstrap terminé: {len(self.capteurs_actifs)} capteurs actifs")
+    
+    def _activer_canal_douleur(self, capteur: str, raison: str):
+        """Active le canal douleur pour un capteur suspendu"""
+        config = self.capteurs_config.get(capteur)
+        if not config:
+            return
+        
+        config.suspendu = True
+        config.en_douleur = True
+        config.raison_suspension = raison
+        
+        # Arrêter les publications sur le nerf normal
+        self.scheduler.remove_nerf(config.nerf_alias)
+        
+        # Créer le canal douleur
+        pain_alias = f"pain_{capteur}"
+        pain_topic = f"pain/{capteur}"
+        
+        # Ajouter au scheduler avec fréquence max
+        self.scheduler.add_nerf(pain_alias, 1.0 / config.freq_cible)
+        
+        # Publier la valeur max en continu
+        self.scheduler.update_payload(pain_alias, {
+            "v": config.seuil_max,
+            "raison": raison,
+            "default": True,
+            "capteur": capteur,
+            "ts": time.time()
+        })
+        
+        logger.critical(f"🚨 CANAL DOULEUR activé pour {capteur}: {raison}")
+    
+    def _gerer_exception_capteur(self, capteur: str, erreur: str):
+        if capteur not in self.capteurs_config:
+            return
+        
+        config = self.capteurs_config[capteur]
+        config.exceptions_consecutives += 1
+        
+        logger.error(f"❌ Exception {capteur} (#{config.exceptions_consecutives}): {erreur}")
+        
+        if config.exceptions_consecutives >= EXCEPTIONS_CONSECUTIVES_MAX:
+            self._activer_canal_douleur(capteur, f"exceptions ({EXCEPTIONS_CONSECUTIVES_MAX})")
+    
+    def _surveiller_temps_lecture(self, capteur: str, duree: float):
+        if capteur not in self.capteurs_config:
+            return
+        
+        config = self.capteurs_config[capteur]
+        periode = config.periode_effective
+        
+        if duree > periode * SEUIL_TIMEOUT_WARNING:
+            logger.warning(f"⚠️ {capteur}: lecture lente ({duree*1000:.2f}ms > {periode*1000:.1f}ms)")
+        
+        if duree > periode:
+            logger.error(f"⛔ {capteur}: TIMEOUT ({duree*1000:.2f}ms > {periode*1000:.1f}ms)")
+            
+            # Réduire la fréquence par 2
+            nouvelle_freq = config.freq_effective / 2
+            if nouvelle_freq < FREQ_MIN_ABSOLUE:
+                # On a atteint la fréquence minimale, on passe en douleur
+                self._activer_canal_douleur(capteur, "timeout critique")
+                return
+            
+            ancienne_freq = config.freq_effective
+            config.freq_effective = nouvelle_freq
+            config.periode_effective = 1.0 / nouvelle_freq
+            
+            logger.warning(f"🔄 {capteur}: réduction fréquence {ancienne_freq:.2f} → {nouvelle_freq:.2f} Hz")
+            
+            self.overrides[capteur] = {
+                "freq_forcee": nouvelle_freq,
+                "raison": "timeout",
+                "timestamp": time.time()
+            }
+            self._sauvegarder_overrides()
+    
+    def _init_zenoh(self):
+        self.conf = zenoh.Config()
+        self.conf.from_file(self.zenoh_config)
+        self.session = zenoh.open(self.conf)
+        logger.info("✅ Session Zenoh ouverte")
+        
+    def _close_zenoh(self):
+        try:
+            self.session.close()
+            logger.info("✅ Session Zenoh fermée")
+        except Exception as e:
+            logger.error(f"Erreur fermeture session Zenoh: {e}")
+    
+    def _init_scheduler_and_nerves(self):
+        def publish_callback(alias: str, payload: dict):
+            for rule in self.rules:
+                if rule.alias == alias:
+                    try:
+                        pub = self.session.declare_publisher(rule.flux_topic)
+                        pub.put(json.dumps(payload))
+                    except Exception as e:
+                        logger.error(f"Erreur publication {alias}: {e}")
+                    return
+            # Si c'est un canal douleur (pain/...)
+            if alias.startswith("pain_"):
+                try:
+                    capteur = alias.replace("pain_", "")
+                    pub = self.session.declare_publisher(f"pain/{capteur}")
+                    pub.put(json.dumps(payload))
+                except Exception as e:
+                    logger.error(f"Erreur publication douleur {alias}: {e}")
+                return
+            logger.warning(f"Aucun topic trouvé pour l'alias {alias}")
 
-    def _sampling_loop(self, frequency: float, metric_names: List[str]):
+        self.scheduler = PubScheduler(
+            publish_callback=publish_callback,
+            base_period=0.01,
+            name="SomaCore_Scheduler"
+        )
+        self.scheduler.start()
+
+        self.nerves = {}
+        for rule in self.rules:
+            if rule.name == "energy":
+                nerve = MetricNerve(rule, self._battery_monitor)
+            else:
+                nerve = MetricNerve(rule)
+            
+            self.nerves[rule.name] = nerve
+            self.scheduler.add_nerf(rule.alias, 1.0 / rule.output_freq_min)
+    
+    def _subscribe_to_reset(self):
+        try:
+            self.reset_sub = self.session.declare_subscriber(
+                "circa/reset", 
+                self._on_reset_signal
+            )
+            logger.info("✅ Abonné à circa/reset")
+        except Exception as e:
+            logger.error(f"Erreur abonnement circa/reset: {e}")
+    
+    def _on_reset_signal(self, sample):
+        try:
+            payload = sample.payload.to_string()
+            data = json.loads(payload)
+            logger.warning(f"🔄 SIGNAL DE RESET REÇU: {data}")
+            threading.Thread(target=self._perform_reset, daemon=True).start()
+        except Exception as e:
+            logger.error(f"Erreur traitement reset signal: {e}")
+    
+    def _perform_reset(self):
+        logger.warning("🔄 DÉBUT DU RESET SomaCore")
+        
+        if hasattr(self, 'scheduler'):
+            logger.info("Arrêt du scheduler...")
+            self.scheduler.stop()
+        
+        logger.info("Réinitialisation des nerfs...")
+        for nerve in self.nerves.values():
+            nerve.reset()
+        
+        logger.info("Réinitialisation du BatteryMonitor...")
+        self._battery_monitor.reset()
+        
+        self._charging = False
+        self._last_charging = False
+        self._temperature = 20.0
+        
+        logger.info("Fermeture de la session Zenoh...")
+        self._close_zenoh()
+        time.sleep(1.0)
+        logger.info("Réouverture de la session Zenoh...")
+        self._init_zenoh()
+        
+        # On garde les overrides mais on enlève les suspensions (on réessaie)
+        self.overrides = {k: v for k, v in self.overrides.items() if not v.get("suspendu", False)}
+        self._sauvegarder_overrides()
+        
+        self._bootstrap_capteurs()
+        
+        logger.info("Recréation du scheduler et des nerfs...")
+        self._init_scheduler_and_nerves()
+        
+        self._subscribe_to_reset()
+        
+        self._demarrer_acquisition()
+        
+        # Redémarrer HealthMonitor
+        if hasattr(self, 'health_monitor'):
+            self.health_monitor.stop()
+        self.health_monitor = HealthMonitor(self.session, self.capteurs_config)
+        self.health_monitor.start()
+        
+        logger.info("Phase de warmup après reset...")
+        self._warmup_phase()
+        
+        logger.warning("✅ RESET SomaCore TERMINÉ")
+    
+    def _demarrer_acquisition(self):
+        capteurs_par_freq = {}
+        for capteur in self.capteurs_actifs:
+            if capteur not in self.capteurs_config:
+                continue
+            config = self.capteurs_config[capteur]
+            if config.suspendu:
+                continue  # Ne pas lancer de thread pour les capteurs suspendus
+            freq = config.freq_effective
+            if freq not in capteurs_par_freq:
+                capteurs_par_freq[freq] = []
+            capteurs_par_freq[freq].append(capteur)
+        
+        for freq, capteurs in capteurs_par_freq.items():
+            logger.info(f"🔄 Acquisition [{freq} Hz]: {capteurs}")
+            threading.Thread(
+                target=self._acquisition_loop,
+                args=(freq, capteurs),
+                daemon=True
+            ).start()
+    
+    def _acquisition_loop(self, frequency: float, capteurs: List[str]):
         period = 1.0 / frequency
-        logger.info(f"▶️  Acquisition [{', '.join(metric_names[:3])}{'...' if len(metric_names) > 3 else ''}] @ {frequency}Hz")
+        logger.info(f"▶️ Acquisition loop {frequency} Hz démarrée pour {len(capteurs)} capteurs")
         
         while self.running:
             start_time = time.time()
             current_time = start_time
             
-            # ✅ CORRECTION : Chaque collecteur ne collecte QUE les métriques demandées
-            metrics = {}
-            for collector in self.collectors:
-                # Demander uniquement les métriques supportées par ce collecteur
-                requested = [name for name in metric_names if collector.can_collect(name)]
-                if requested:
-                    collector_metrics = collector.collect(requested)
-                    metrics.update(collector_metrics)
-            
-            # ✅ NOUVEAU : Détection événements spéciaux
-            
-            # Event 1: Changement état charging (publication simple)
-            if "energy_charging" in metrics and "energy" in metrics:
-                new_charging = metrics["energy_charging"]
-                battery_level = metrics["energy"]
+            for capteur in capteurs:
+                if capteur not in self.capteurs_actifs:
+                    continue
                 
-                # Mettre à jour le moniteur de batterie
-                battery_info = self._battery_monitor.update(
-                    level=battery_level,
-                    charging=new_charging,
-                    timestamp=current_time
-                )
+                config = self.capteurs_config.get(capteur)
+                if not config or config.suspendu:
+                    continue
                 
-                # Détecter changement d'état
-                if new_charging != self._last_charging:
-                    self._charging = new_charging
-                    self._last_charging = new_charging
-                    self._charging_changed_event.set()
+                collecteur = next((c for c in self.collectors if c.can_collect(capteur)), None)
+                if not collecteur:
+                    continue
+                
+                try:
+                    debut_lecture = time.perf_counter()
                     
-                    logger.warning(f"⚡ ÉVÉNEMENT: Charging {'ACTIVÉ' if new_charging else 'DÉSACTIVÉ'} | Niveau: {battery_level:.1f}%")
-                else:
-                    self._charging = new_charging
-                
-                # Publication energy/charging UNIQUEMENT si en charge
-                if new_charging:
-                    charging_payload = {
-                        "charging": True,
-                        "level": round(battery_level, 1),
-                        "timestamp": datetime.fromtimestamp(current_time, timezone.utc).isoformat(),
-                        "charge_rate": round(battery_info["charge_rate"] * 3600, 2) if battery_info["charge_rate"] else 0.0,  # %/h
-                        "time_remaining_seconds": round(battery_info["time_remaining"]) if battery_info["time_remaining"] else None,
-                        "charge_quality": battery_info["charge_quality"]
-                    }
+                    metrics = collecteur.collect([capteur])
+                    valeur = metrics.get(capteur, 0.0)
                     
-                    try:
-                        self.pub_charging.put(json.dumps(charging_payload))
-                    except Exception as e:
-                        logger.error(f"Erreur publication energy/charging: {e}")
+                    duree_lecture = time.perf_counter() - debut_lecture
+                    
+                    self._surveiller_temps_lecture(capteur, duree_lecture)
+                    
+                    if capteur == "energy" and "_energy_charging" in metrics:
+                        charging = metrics["_energy_charging"]
+                        battery_info = self._battery_monitor.update(valeur, charging, current_time)
+                        if "energy" in self.nerves:
+                            self.nerves["energy"].push(valeur, current_time, battery_info)
+                        
+                        if charging != self._last_charging:
+                            self._charging = charging
+                            self._last_charging = charging
+                            logger.warning(f"⚡ Charging {'ACTIVÉ' if charging else 'DÉSACTIVÉ'} | Niveau: {valeur:.1f}%")
+                        else:
+                            self._charging = charging
+                    
+                    elif capteur in self.nerves:
+                        self.nerves[capteur].push(valeur, current_time)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erreur lecture {capteur}: {e}")
+                    self._gerer_exception_capteur(capteur, str(e))
             
-            elif "energy_charging" in metrics:
-                # Fallback si seulement charging disponible
-                self._charging = metrics["energy_charging"]
-            
-            # Event 2: Température critique
-            if "temperature" in metrics:
-                temp = metrics["temperature"]
-                self._temperature = temp
-                # Seuil critique à 80°C
-                was_critical = self._temp_critical
-                self._temp_critical = temp > 80.0
-                if self._temp_critical and not was_critical:
-                    self._temp_critical_event.set()
-                    logger.error(f"🔥 ÉVÉNEMENT CRITIQUE: Température {temp:.1f}°C > 80°C !")
-                elif not self._temp_critical and was_critical:
-                    logger.info(f"❄️  Température revenue à la normale: {temp:.1f}°C")
-            
-            # Pousser dans les nerfs correspondants
-            for name in metric_names:
-                if name in metrics and name in self.nerves:
-                    self.nerves[name].push(metrics[name], current_time)
-            
-            # Respecter la période d'échantillonnage
             elapsed = time.time() - start_time
             sleep_time = max(0.0001, period - elapsed)
             time.sleep(sleep_time)
 
     def _nerve_process_loop(self, metric_name: str):
-        """✅ CORRIGÉ : Boucle de traitement avec attente de nouvelles données."""
         nerve = self.nerves[metric_name]
-        generator = self.generators[metric_name]
-        logger.info(f"🔧 Thread traitement [{metric_name}] démarré")
+        logger.info(f"🔧 Traitement [{metric_name}] démarré")
         
         while self.running:
-            # ✅ CORRECTION : Attendre une nouvelle donnée au lieu de boucler
             if not nerve.wait_for_data(timeout=2.0):
                 continue
             
             nerve.clear_event()
             
-            val, timestamp = nerve.get_latest()
+            val, timestamp, extra_data = nerve.get_latest()
             if val is None or not nerve.warmup_complete:
                 continue
             
-            # Calculer le stress
             stress = nerve.get_stress(val, self._charging)
-
-            # ✅ NOUVEAU : Calcul de fréquence selon le type de métrique
+            period, zone_name = nerve.get_period_for_value(val)
             
-            # CAS 1: TEMPÉRATURE (GT + LT) → Courbe unifiée en "U"
-            if metric_name == "temperature" and nerve.rule.gt and nerve.rule.lt:
-                new_freq = freq_from_value_unified(
-                    val, 
-                    nerve.rule.gt, 
-                    nerve.rule.lt, 
-                    nerve.rule.output_freq_min, 
-                    nerve.rule.output_freq_max
-                )
-            
-            # CAS 2: BATTERIE (LT uniquement) → Même courbe que GT avec f_base=1Hz
-            # Note: energy utilise LT mais seulement pour calcul stress ego
-            # La publication se fait via energy_discharge avec GT
-            elif metric_name == "energy" and nerve.rule.lt:
-                if not self._charging:  # Seulement si pas en charge
-                    new_freq = freq_from_value_lt_battery(
-                        val, 
-                        nerve.rule.lt, 
-                        f_base=1.0,  # Base à 1 Hz (au lieu de output_freq_min)
-                        f_max=nerve.rule.output_freq_max
-                    )
-                else:
-                    new_freq = 1.0  # En charge → 1 Hz fixe
-            
-            # CAS 2b: ENERGY_DISCHARGE (GT) → Publié seulement si NOT charging
-            elif metric_name == "energy_discharge" and nerve.rule.gt:
-                if not self._charging:  # Seulement si sur batterie
-                    new_freq = freq_from_value_gt(
-                        val,
-                        nerve.rule.gt,
-                        nerve.rule.output_freq_min,
-                        nerve.rule.output_freq_max
-                    )
-                    
-                    # Enrichir le payload avec infos de décharge
-                    battery_info = self._battery_monitor.history[-1] if self._battery_monitor.history else None
-                    if battery_info:
-                        discharge_rate = self._battery_monitor.update(
-                            100.0 - val,  # Reconvertir en level
-                            False,
-                            timestamp
-                        )
-                        
-                        payload = json.dumps({
-                            "v": round(val, 2),
-                            "stress": round(stress, 3),
-                            "ts": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-                            "freq": round(new_freq, 3),
-                            "battery_level": round(100.0 - val, 2),  # Niveau réel
-                            "discharge_rate": round(discharge_rate["discharge_rate"] * 3600, 2) if discharge_rate["discharge_rate"] else 0.0,  # %/h
-                            "time_remaining_seconds": round(discharge_rate["time_remaining"]) if discharge_rate["time_remaining"] else None,
-                            "confidence": discharge_rate.get("confidence", "low")
-                        })
-                        new_period = 1.0 / new_freq
-                        generator.update(new_period, payload)
-                        continue  # Skip le payload générique ci-dessous
-                else:
-                    # En charge → ne pas publier energy_discharge
-                    continue
-            
-            # CAS 3: Seuils GT uniquement
-            elif nerve.rule.gt and len(nerve.rule.gt) >= 3 and val > nerve.rule.gt[0]:
-                new_freq = freq_from_value_gt(
-                    val, 
-                    nerve.rule.gt, 
-                    nerve.rule.output_freq_min, 
-                    nerve.rule.output_freq_max
-                )
-            
-            # CAS 4: Seuils LT uniquement (autres métriques)
-            elif nerve.rule.lt and len(nerve.rule.lt) >= 3 and val < nerve.rule.lt[0]:
-                new_freq = freq_from_value_lt(
-                    val, 
-                    nerve.rule.lt, 
-                    nerve.rule.output_freq_min, 
-                    nerve.rule.output_freq_max
-                )
-            
-            # CAS 5: Pas d'alerte
-            else:
-                new_freq = nerve.rule.output_freq_min
-
-            new_period = 1.0 / new_freq
-
-            # Publier
-            payload = json.dumps({
+            payload_data = {
                 "v": round(val, 2),
                 "stress": round(stress, 3),
                 "ts": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-                "freq": round(new_freq, 3)
-            })
-            generator.update(new_period, payload)
-
-    def _ego_process_loop(self):
-        """✅ CORRIGÉ : Boucle de traitement pour le nerf ego avec coefficients de mixage."""
-        if not self.ego_gen:
-            return
-        
-        ego_rule = next((r for r in self.rules if r.name == "ego"), None)
-        if not ego_rule:
-            return
-        
-        # Coefficients de mixage (par défaut tous à 1.0)
-        mixing_coeffs = ego_rule.mixing_coefficients or {}
-        normalization = ego_rule.normalization
-        
-        logger.info(f"🧠 Thread ego démarré (normalisation: {normalization})")
-        if mixing_coeffs:
-            logger.info(f"   Coefficients de mixage: {mixing_coeffs}")
-        
-        while self.running:
-            weighted_stresses = []
-            stress_details = {}
+                "freq": round(1.0 / period, 3),
+                "period_ms": round(period * 1000, 1),
+                "zone": zone_name
+            }
             
-            for name, nerve in self.nerves.items():
-                if nerve.warmup_complete and len(nerve.history) > 0:
-                    stress = nerve.current_stress
+            if metric_name == "energy" and extra_data:
+                payload_data.update({
+                    "charging": extra_data["charging"],
+                    "level": extra_data["level"],
+                    "charge_rate": extra_data["charge_rate"],
+                    "discharge_rate": extra_data["discharge_rate"],
+                    "minutes_to_full": extra_data["minutes_to_full"],
+                    "minutes_to_empty": extra_data["minutes_to_empty"],
+                    "battery_confidence": extra_data["confidence"]
+                })
+            
+            alias = nerve.rule.alias
+            self.scheduler.update_payload(alias, payload_data)
+            
+            current_period_ms = period * 1000
+            last_period_ms = nerve.current_period * 1000 if hasattr(nerve, 'current_period') else 0
+            
+            if abs(current_period_ms - last_period_ms) > max(10, last_period_ms * 0.1):
+                self.scheduler.update_period(alias, period)
+                nerve.current_period = period
+                
+                old_freq = 1.0 / nerve.current_period if hasattr(nerve, 'current_period') else nerve.rule.output_freq_min
+                new_freq = 1.0 / period
+                
+                try:
+                    unit = ""
+                    if metric_name == 'temperature':
+                        unit = "°C"
+                    elif metric_name == 'energy':
+                        unit = "%"
                     
-                    # Appliquer le coefficient de mixage
-                    coeff = mixing_coeffs.get(name, 1.0)
-                    weighted_stress = stress * coeff
+                    zone_display = ZONE_NAMES.get(zone_name, zone_name)
                     
-                    weighted_stresses.append(weighted_stress ** 2)
-                    stress_details[name] = {
-                        "raw": round(stress, 3),
-                        "coeff": coeff,
-                        "weighted": round(weighted_stress, 3)
-                    }
-            
-            # Calcul selon la méthode de normalisation
-            if normalization == "weighted_rms":
-                # RMS pondéré (par défaut)
-                global_stress = math.sqrt(sum(weighted_stresses)) if weighted_stresses else 0.0
-            elif normalization == "max":
-                # Maximum des stress pondérés
-                global_stress = max([math.sqrt(s) for s in weighted_stresses]) if weighted_stresses else 0.0
-            elif normalization == "mean":
-                # Moyenne des stress pondérés
-                global_stress = sum([math.sqrt(s) for s in weighted_stresses]) / len(weighted_stresses) if weighted_stresses else 0.0
-            else:
-                # Par défaut: weighted_rms
-                global_stress = math.sqrt(sum(weighted_stresses)) if weighted_stresses else 0.0
-            
-            global_stress = min(global_stress, 1.0)
-
-            if self.ego_nerve:
-                self.ego_nerve.current_stress = global_stress
-            
-            # ✅ NOUVEAU : Ajouter info événements spéciaux dans le payload
-            payload = json.dumps({
-                "v": round(global_stress, 3),
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "normalization": normalization,
-                "details": stress_details,
-                "events": {
-                    "charging": self._charging,
-                    "temp_critical": self._temp_critical,
-                    "temperature": round(self._temperature, 1)
-                }
-            })
-            self.ego_gen.update(1.0, payload)
-            time.sleep(1.0)  # Fréquence fixe 1 Hz pour ego
+                    logger.info(
+                        f"🔄 FRÉQUENCE [{metric_name}] "
+                        f"Valeur: {val}{unit} | "
+                        f"Zone: {zone_display} | "
+                        f"{old_freq:.2f}Hz → {new_freq:.2f}Hz "
+                        f"({last_period_ms:.0f}ms → {current_period_ms:.0f}ms)"
+                    )
+                except Exception as e:
+                    logger.debug(f"🔄 FRÉQUENCE {metric_name}: {old_freq:.2f}Hz → {new_freq:.2f}Hz")
 
     def _warmup_phase(self):
-        """Phase de warmup initiale."""
-        logger.info("🔥 Warmup en cours...")
-        time.sleep(WARMUP_SAMPLES * 0.1)  # Laisser les threads collecter
+        logger.info("🔥 Warmup...")
+        time.sleep(WARMUP_SAMPLES * 0.1)
         logger.info("✅ Warmup terminé")
 
     def stop(self):
-        """Arrêt propre du système."""
-        logger.info("🛑 Arrêt en cours...")
+        logger.info("🛑 Arrêt...")
         self.running = False
-        self._phase_sync_event.set()
         
-        for generator in self.generators.values():
-            generator.stop()
-        if self.ego_gen:
-            self.ego_gen.stop()
+        if hasattr(self, 'health_monitor'):
+            self.health_monitor.stop()
         
-        self.session.close()
+        if hasattr(self, 'scheduler'):
+            self.scheduler.stop()
+        
+        self._close_zenoh()
         logger.info("✅ SomaCore éteint")
 
 # ================== MAIN ==================
 if __name__ == "__main__":
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__)) 
-        logger.info(f"SomaCore dir : {script_dir}")
+        logger.info(f"SomaCore dir: {script_dir}")
 
         zenoh_config_file = "zenoh_config.json5"
         zenoh_filepath = os.path.join(script_dir, '..\\config', zenoh_config_file)
         if not os.path.exists(zenoh_filepath):
-            logger.error(f"❌ Zenoh config manquante : {zenoh_filepath}")
+            logger.error(f"❌ Zenoh config manquante: {zenoh_filepath}")
             sys.exit(1)
 
         config_file = "soma_rules.json"
         config_filepath = os.path.join(script_dir, config_file)
         if not os.path.exists(config_filepath):
-            logger.error(f"❌ App Config manquante : {config_filepath}")
+            logger.error(f"❌ Config manquante: {config_filepath}")
             sys.exit(1)
         
         core = SomaCore(zenoh_filepath, config_filepath)
-        logger.info("✅ SomaCore démarré - Appuyez sur Ctrl+C pour arrêter")
+        logger.info("✅ SomaCore démarré - Ctrl+C pour arrêter")
+        
         while True:
             time.sleep(1)
+            
     except (KeyboardInterrupt, SystemExit):
         logger.info("👋 Arrêt demandé")
     except Exception as e:
-        logger.error(f"💥 Erreur Fatale: {e}", exc_info=True)
+        logger.error(f"💥 Erreur: {e}", exc_info=True)
