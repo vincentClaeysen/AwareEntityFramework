@@ -352,123 +352,147 @@ class StreamsMonitor:
                 self._draw_stream(stream, group.x + 10, stream_y, osc_width, 90, payload_width)
                 stream_y += 100
 
-    def _draw_stream(self, stream, x, y, w, h, payload_width):
-        now = time.time()
+  
+def _draw_stream(self, stream, x, y, w, h, payload_width):
+    now = time.time()
+    
+    # Couleur de base basée sur la fréquence
+    base_color = stream.color_engine.get_color_from_frequency(stream.current_frequency, stream.type)
+    halo_intensity = stream.color_engine.get_halo_intensity(stream.current_frequency, stream.type)
+    
+    # ===== DESSIN DE L'OSCILLOSCOPE =====
+    # Dessiner le halo uniquement sur le cadre
+    for i in range(3, 0, -1):
+        alpha = int(20 * halo_intensity * (i / 3))
+        if alpha > 0:
+            # Dessiner le halo comme un contour plus épais
+            halo_rect = pygame.Rect(x - i, y - i, w + 2*i, h + 2*i)
+            pygame.draw.rect(self.screen, (*base_color, alpha), halo_rect, 2)
+    
+    # Fond sombre
+    pygame.draw.rect(self.screen, (10, 10, 10), (x, y, w, h))
+    pygame.draw.rect(self.screen, base_color, (x, y, w, h), 1)
+    
+    # Ligne horizontale centrale (le "temps")
+    mid_y = y + h // 2
+    line_color = self._interpolate_color(base_color, (200, 200, 200), 0.7)
+    pygame.draw.line(self.screen, line_color, (x, mid_y), (x + w, mid_y), 2)
+    
+    # Récupérer les impulsions récentes
+    recent_impulses = stream.get_recent_impulses(now)
+    
+    # Hauteur fixe des pics
+    peak_h = int(h * 0.4)  # 40% de la hauteur totale
+    
+    # Trouver le pic le plus récent (s'il existe)
+    most_recent_pic = None
+    if recent_impulses:
+        # Le dernier pic est celui avec le timestamp le plus grand
+        most_recent_pic = max(recent_impulses, key=lambda x: x[0])
+        recent_timestamp, recent_payload = most_recent_pic
+    
+    # Dessiner les pics (forme de /\ partant de la ligne centrale)
+    for timestamp, payload in recent_impulses:
+        # Calculer la position x basée sur le timestamp
+        age = now - timestamp
+        progress = 1.0 - (age / stream.window_duration)  # 0 = vieux, 1 = récent
+        px = x + int(w * progress)
         
-        # Couleur de base basée sur la fréquence
-        base_color = stream.color_engine.get_color_from_frequency(stream.current_frequency, stream.type)
-        halo_intensity = stream.color_engine.get_halo_intensity(stream.current_frequency, stream.type)
+        # Couleur du pic (plus intense si récent)
+        color_intensity = 0.5 + 0.5 * (1.0 - age / stream.window_duration)
+        pic_color = self._interpolate_color(base_color, (255, 255, 255), color_intensity)
         
-        # ===== DESSIN DE L'OSCILLOSCOPE =====
-        # Dessiner le halo uniquement sur le cadre
-        for i in range(3, 0, -1):
-            alpha = int(20 * halo_intensity * (i / 3))
-            if alpha > 0:
-                # Dessiner le halo comme un contour plus épais
-                halo_rect = pygame.Rect(x - i, y - i, w + 2*i, h + 2*i)
-                pygame.draw.rect(self.screen, (*base_color, alpha), halo_rect, 2)
+        # Dessiner le pic en forme de /\ partant de la ligne centrale
+        if px > x and px < x + w:
+            # Ligne gauche du /\ (de la ligne centrale vers le haut)
+            pygame.draw.line(self.screen, pic_color,
+                           (px - 3, mid_y - peak_h),  # Sommet gauche
+                           (px, mid_y),  # Base au centre
+                           2)
+            # Ligne droite du /\ (de la ligne centrale vers le haut)
+            pygame.draw.line(self.screen, pic_color,
+                           (px + 3, mid_y - peak_h),  # Sommet droit
+                           (px, mid_y),  # Base au centre
+                           2)
+            
+            # Petit point au sommet
+            pygame.draw.circle(self.screen, (255, 255, 255), (px, mid_y - peak_h), 2)
+            
+            # Petite ligne verticale à la base pour renforcer l'effet
+            pygame.draw.line(self.screen, pic_color,
+                           (px, mid_y - 1),
+                           (px, mid_y + 1), 1)
+    
+    # === POINT BLANC SUR LE PIC LE PLUS RÉCENT ===
+    if most_recent_pic:
+        # Calculer la position du pic le plus récent
+        recent_age = now - recent_timestamp
+        recent_progress = 1.0 - (recent_age / stream.window_duration)
+        recent_px = x + int(w * recent_progress)
         
-        # Fond sombre
-        pygame.draw.rect(self.screen, (10, 10, 10), (x, y, w, h))
-        pygame.draw.rect(self.screen, base_color, (x, y, w, h), 1)
-        
-        # Ligne horizontale centrale (le "temps")
-        mid_y = y + h // 2
-        line_color = self._interpolate_color(base_color, (200, 200, 200), 0.7)
-        pygame.draw.line(self.screen, line_color, (x, mid_y), (x + w, mid_y), 2)
-        
-        # Point représentant l'instant courant (extrême droite)
+        if recent_px > x and recent_px < x + w:
+            # Dessiner le point blanc au sommet du pic le plus récent
+            pygame.draw.circle(self.screen, (255, 255, 255), (recent_px, mid_y - peak_h), 5)
+            # Petit halo autour du point
+            pygame.draw.circle(self.screen, (*base_color, 100), (recent_px, mid_y - peak_h), 8, 1)
+    else:
+        # Si pas de pic, garder le point à l'extrême droite comme avant
         pygame.draw.circle(self.screen, (255, 255, 255), (x + w, mid_y), 3)
+    
+    # Informations textuelles sur l'oscilloscope
+    topic_color = (0, 191, 255) if stream.type == "nerf" else (255, 165, 0)
+    txt_topic = self.font_small.render(f"{stream.topic}", True, topic_color)
+    self.screen.blit(txt_topic, (x + 5, y + 5))
+    
+    # Fréquence et compteur
+    freq_text = f"{stream.current_frequency:.1f} Hz | {stream.message_count} msgs"
+    txt_freq = self.font_small.render(freq_text, True, base_color)
+    self.screen.blit(txt_freq, (x + 5, y + h - 35))
+    
+    # ===== ZONE D'AFFICHAGE DU PAYLOAD =====
+    payload_x = x + w + 10
+    payload_y = y
+    payload_h = h
+    
+    # Fond pour le payload
+    pygame.draw.rect(self.screen, (15, 15, 15), (payload_x, payload_y, payload_width, payload_h))
+    pygame.draw.rect(self.screen, base_color, (payload_x, payload_y, payload_width, payload_h), 1)
+    
+    # Afficher le dernier payload
+    if stream.last_payload:
+        # Formater le payload de façon lisible
+        payload_str = json.dumps(stream.last_payload)
         
-        # Récupérer les impulsions récentes
-        recent_impulses = stream.get_recent_impulses(now)
+        # Découper le payload en lignes
+        max_chars = int(payload_width / 6)
+        lines = []
+        current_line = ""
         
-        # Hauteur fixe des pics
-        peak_h = int(h * 0.4)  # 40% de la hauteur totale
-        
-        # Dessiner les pics (forme de /\ spontané)
-        for timestamp, payload in recent_impulses:
-            # Calculer la position x basée sur le timestamp
-            age = now - timestamp
-            progress = 1.0 - (age / stream.window_duration)  # 0 = vieux, 1 = récent
-            px = x + int(w * progress)
-            
-            # Couleur du pic (plus intense si récent)
-            color_intensity = 0.5 + 0.5 * (1.0 - age / stream.window_duration)
-            pic_color = self._interpolate_color(base_color, (255, 255, 255), color_intensity)
-            
-            # Dessiner le pic en forme de /\ (deux lignes)
-            if px > x and px < x + w:
-                # Ligne gauche du /\
-                pygame.draw.line(self.screen, pic_color,
-                               (px - 3, mid_y - peak_h),
-                               (px, mid_y), 2)
-                # Ligne droite du /\
-                pygame.draw.line(self.screen, pic_color,
-                               (px + 3, mid_y - peak_h),
-                               (px, mid_y), 2)
-                
-                # Petit point au sommet
-                pygame.draw.circle(self.screen, (255, 255, 255), (px, mid_y - peak_h), 2)
-        
-        # Informations textuelles sur l'oscilloscope
-        topic_color = (0, 191, 255) if stream.type == "nerf" else (255, 165, 0)
-        txt_topic = self.font_small.render(f"{stream.topic}", True, topic_color)
-        self.screen.blit(txt_topic, (x + 5, y + 5))
-        
-        # Fréquence et compteur
-        freq_text = f"{stream.current_frequency:.1f} Hz | {stream.message_count} msgs"
-        txt_freq = self.font_small.render(freq_text, True, base_color)
-        self.screen.blit(txt_freq, (x + 5, y + h - 35))
-        
-        # ===== ZONE D'AFFICHAGE DU PAYLOAD =====
-        payload_x = x + w + 10
-        payload_y = y
-        payload_h = h
-        
-        # Fond pour le payload
-        pygame.draw.rect(self.screen, (15, 15, 15), (payload_x, payload_y, payload_width, payload_h))
-        pygame.draw.rect(self.screen, base_color, (payload_x, payload_y, payload_width, payload_h), 1)
-        
-        # Afficher le dernier payload
-        if stream.last_payload:
-            # Formater le payload de façon lisible
-            payload_str = json.dumps(stream.last_payload)
-            
-            # Découper le payload en lignes
-            max_chars = int(payload_width / 6)
-            lines = []
-            current_line = ""
-            
-            for char in payload_str:
-                if len(current_line) < max_chars:
-                    current_line += char
-                else:
-                    lines.append(current_line)
-                    current_line = char
-            
-            if current_line:
+        for char in payload_str:
+            if len(current_line) < max_chars:
+                current_line += char
+            else:
                 lines.append(current_line)
-            
-            # Limiter à 3 lignes maximum
-            lines = lines[:3]
-            
-            # Afficher chaque ligne
-            line_y = payload_y + 10
-            for line in lines:
-                payload_surf = self.font_payload.render(line, True, (200, 200, 200))
-                self.screen.blit(payload_surf, (payload_x + 5, line_y))
-                line_y += 12
-        else:
-            # Aucun message reçu
-            no_data = self.font_payload.render("⏳...", True, (100, 100, 100))
-            self.screen.blit(no_data, (payload_x + 5, payload_y + 15))
-
-    def _interpolate_color(self, c1, c2, t):
-        """Interpole entre deux couleurs RGB"""
-        return tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3))
-
-    def handle_click(self, pos):
+                current_line = char
+        
+        if current_line:
+            lines.append(current_line)
+        
+        # Limiter à 3 lignes maximum
+        lines = lines[:3]
+        
+        # Afficher chaque ligne
+        line_y = payload_y + 10
+        for line in lines:
+            payload_surf = self.font_payload.render(line, True, (200, 200, 200))
+            self.screen.blit(payload_surf, (payload_x + 5, line_y))
+            line_y += 12
+    else:
+        # Aucun message reçu
+        no_data = self.font_payload.render("⏳...", True, (100, 100, 100))
+        self.screen.blit(no_data, (payload_x + 5, payload_y + 15))  
+ 
+   def handle_click(self, pos):
         """Gère les clics souris pour plier/déplier les groupes"""
         for group in self.groups:
             if group.contains_point(pos[0], pos[1]):
