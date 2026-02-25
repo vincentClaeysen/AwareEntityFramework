@@ -1,0 +1,60 @@
+{
+  "sampling_profiles": {
+    "self": {
+      "frequency": 1.0,
+      "description": "Profile for self metrics"
+    }
+  },
+  "default_sampling_profile": "self",
+
+  "metrics": {
+    "self_cpu": {
+      "alias": "Process CPU",
+      "flux_topic": "soma/self/cpu",
+      "pain_topic": "pain/soma_core/self/cpu",
+      "threshold_GT": [30, 50, 80],
+      "sampling_profile": "self",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "silence_below_threshold": true,
+      "weight": 0.6,
+      "description": "CPU usage of this process"
+    },
+    "self_memory": {
+      "alias": "Process Memory",
+      "flux_topic": "soma/self/memory",
+      "pain_topic": "pain/soma_core/self/memory",
+      "threshold_GT": [20, 40, 60],
+      "sampling_profile": "self",
+      "output_freq_min": 1.0,
+      "output_freq_max": 8.0,
+      "silence_below_threshold": true,
+      "weight": 0.5,
+      "description": "Memory usage of this process"
+    },
+    "self_threads": {
+      "alias": "Process Threads",
+      "flux_topic": "soma/self/threads",
+      "pain_topic": "pain/soma_core/self/threads",
+      "threshold_GT": [30, 50, 80],
+      "sampling_profile": "self",
+      "output_freq_min": 0.5,
+      "output_freq_max": 5.0,
+      "silence_below_threshold": true,
+      "weight": 0.3,
+      "description": "Number of threads (normalized)"
+    },
+    "self_fds": {
+      "alias": "Process File Descriptors",
+      "flux_topic": "soma/self/fds",
+      "pain_topic": "pain/soma_core/self/fds",
+      "threshold_GT": [50, 70, 90],
+      "sampling_profile": "self",
+      "output_freq_min": 0.5,
+      "output_freq_max": 5.0,
+      "silence_below_threshold": true,
+      "weight": 0.3,
+      "description": "File descriptors (normalized)"
+    }
+  }
+}
