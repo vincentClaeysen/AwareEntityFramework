@@ -1,0 +1,60 @@
+{
+  "sampling_profiles": {
+    "slow": {
+      "frequency": 1.0,
+      "description": "Slow profile for system metrics"
+    }
+  },
+  "default_sampling_profile": "slow",
+
+  "metrics": {
+    "cpu": {
+      "alias": "CPU Load",
+      "flux_topic": "soma/cpu",
+      "pain_topic": "pain/soma/cpu",
+      "threshold_GT": [50, 70, 90],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "silence_below_threshold": true,
+      "weight": 0.8,
+      "description": "CPU load percentage"
+    },
+    "memory": {
+      "alias": "Memory",
+      "flux_topic": "soma/memory",
+      "pain_topic": "pain/soma/memory",
+      "threshold_GT": [60, 80, 95],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 8.0,
+      "silence_below_threshold": true,
+      "weight": 0.7,
+      "description": "Memory usage"
+    },
+    "temperature": {
+      "alias": "Temperature",
+      "flux_topic": "soma/temperature",
+      "pain_topic": "pain/soma/temperature",
+      "threshold_GT": [70, 85, 95],
+      "sampling_profile": "slow",
+      "output_freq_min": 0.01,
+      "output_freq_max": 20.0,
+      "silence_below_threshold": true,
+      "weight": 1.0,
+      "description": "Internal temperature (°C)"
+    },
+    "energy": {
+      "alias": "Energy",
+      "flux_topic": "soma/energy",
+      "pain_topic": "pain/soma/energy",
+      "threshold_LT": [60, 30, 15],
+      "sampling_profile": "slow",
+      "output_freq_min": 1.0,
+      "output_freq_max": 10.0,
+      "silence_below_threshold": true,
+      "weight": 0.9,
+      "description": "Battery level"
+    }
+  }
+}
