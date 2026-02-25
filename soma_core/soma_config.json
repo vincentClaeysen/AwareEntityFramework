@@ -1,0 +1,23 @@
+{
+  "bootstrap": {
+    "readings": 5,
+    "slowness_threshold": 3.0,
+    "variability_threshold": 0.5,
+    "normal_timeout_factor": 1.5,
+    "unstable_timeout_factor": 2.5
+  },
+  "acquisition": {
+    "min_absolute_frequency": 0.1,
+    "timeout_warning_ratio": 0.8,
+    "max_consecutive_exceptions": 3
+  },
+  "scheduler": {
+    "base_period": 0.01
+  },
+  "sleep": {
+    "deep_sleep_factor": 0.1,
+    "light_sleep_factor": 0.3,
+    "dream_factor": 0.5,
+    "wake_factor": 1.0
+  }
+}
