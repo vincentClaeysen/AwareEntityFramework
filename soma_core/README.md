@@ -59,6 +59,4 @@ SomaCore is a **functional digital organ** with autonomous behavior, self‑perc
 | **Nerve** | `nerve_session` | Diagnostics, pain, organ (urgent signals) |
 | **Meta** | `meta_session` | Configuration, health, validation |
 
----
 
-## 📁 Project Structure
