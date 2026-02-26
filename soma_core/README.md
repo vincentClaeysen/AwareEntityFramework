@@ -26,7 +26,7 @@ SomaCore is a **functional digital organ** with autonomous behavior, self‑perc
 
 ### 🌡️ **Dual Perception**
 - **External** (`domain="soma"`) : System metrics (CPU, memory, temperature, battery)
-- **Internal** (`domain="soma_core"`) : Process metrics (self_cpu, self_memory, self_threads, self_fds)
+- **Internal** (`domain="soma_core"`) : Process metrics (self_cpu, self_memory, self_threads)
 
 ### ⚡ **Frequency = Urgency, `v` = Amplitude**
 - Frequency (0–50 Hz) codes the **stress level** (urgency)
@@ -38,7 +38,7 @@ SomaCore is a **functional digital organ** with autonomous behavior, self‑perc
 - Full reset after deep sleep exit
 
 ### 🩺 **Self‑Health Monitoring**
-- Tracks its own CPU, memory, threads, file descriptors
+- Tracks its own CPU, memory, threads
 - Detects memory leaks via trend analysis (linear regression)
 - Emits self‑diagnostic spikes on critical conditions
 
