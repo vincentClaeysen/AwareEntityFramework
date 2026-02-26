@@ -11,7 +11,7 @@
 
 It translates these readings into **frequency‑modulated nerve signals** using three distinct types of neural signaling, and communicates its state via **lymphatic channels** (health and configuration). It receives dynamic configuration via a dedicated retention topic and can validate proposed changes before acceptance.
 
-SomaCore is **not** the body – it is a **functional digital organ** with autonomous behavior, self‑perception, graceful degradation, and deep‑sleep reset, designed to work in concert with other organs like SensoryCore, CircaCore, and the NAA.
+SomaCore is a **functional digital organ** with autonomous behavior, self‑perception, graceful degradation, and deep‑sleep reset, designed to work in concert with other organs like SensoryCore, CircaCore, and the NAA.
 
 ---
 
