@@ -43,18 +43,6 @@
       "silence_below_threshold": true,
       "weight": 0.3,
       "description": "Number of threads (normalized)"
-    },
-    "self_fds": {
-      "alias": "Process File Descriptors",
-      "flux_topic": "soma/self/fds",
-      "pain_topic": "pain/soma_core/self/fds",
-      "threshold_GT": [50, 70, 90],
-      "sampling_profile": "self",
-      "output_freq_min": 0.5,
-      "output_freq_max": 5.0,
-      "silence_below_threshold": true,
-      "weight": 0.3,
-      "description": "File descriptors (normalized)"
     }
   }
 }
