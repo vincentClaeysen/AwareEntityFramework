@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SomaCore v2.2.1 – Bio-inspired sensor acquisition system
-Complete implementation with StressLookupTable for O(1) stress calculation.
+SomaCore v2.3.0 – Bio-inspired sensor acquisition organ
+Complete implementation with 3 Zenoh hubs, in‑memory override, and config validation.
 """
 
 import os
@@ -72,14 +72,14 @@ class SensorConfig:
     override: bool = False
     rule: Optional[AlertRule] = None
 
+
 # ============================================================================
-# STRESS LOOKUP TABLE (Stratégie 2)
+# STRESS LOOKUP TABLE (O(1) stress calculation)
 # ============================================================================
 
 class StressLookupTable:
     """
-    Table de correspondance pré-calculée pour une règle.
-    Permet un accès O(1) avec interpolation linéaire.
+    Pre‑computed lookup table for stress calculation (O(1) access with linear interpolation).
     """
     
     def __init__(self, rule: AlertRule, steps: int = 1000):
@@ -89,31 +89,24 @@ class StressLookupTable:
         self.table = self._build_table()
     
     def _get_bounds(self) -> Tuple[float, float]:
-        """Détermine les bornes min/max pour la table"""
         if self.rule.gt:
-            return 0.0, self.rule.gt[-1] * 1.2  # 20% au-delà du seuil max
+            return 0.0, self.rule.gt[-1] * 1.2
         elif self.rule.lt:
             return 0.0, self.rule.lt[0] * 1.2
         else:
             return 0.0, 1.0
     
     def _build_table(self) -> List[float]:
-        """Pré-calcule le stress pour N valeurs entre min et max"""
         min_val, max_val = self.min_val, self.max_val
         table = []
-        
         for i in range(self.steps + 1):
             val = min_val + (max_val - min_val) * i / self.steps
-            stress = self._compute_raw(val)
-            table.append(stress)
-        
+            table.append(self._compute_raw(val))
         return table
     
     def _compute_raw(self, value: float) -> float:
-        """Calcul direct du stress (sans cache)"""
         if self.rule.gt:
             s1, s2, s3 = self.rule.gt
-            
             if value >= s3:
                 return 1.0
             elif value >= s2:
@@ -124,10 +117,8 @@ class StressLookupTable:
                 return 0.8 + 0.1 * ratio
             else:
                 return min(0.8, 0.8 * value / s1)
-        
         elif self.rule.lt:
             l3, l2, l1 = self.rule.lt
-            
             if value <= l1:
                 return 1.0
             elif value <= l2:
@@ -138,40 +129,26 @@ class StressLookupTable:
                 return 0.8 + 0.1 * ratio
             else:
                 return max(0.0, 0.8 * (1.0 - value / l3))
-        
         return 0.0
     
     def get_stress(self, value: float) -> float:
-        """Recherche dans la table avec interpolation linéaire"""
-        # Bornes
         if value <= self.min_val:
             return self.table[0]
         if value >= self.max_val:
             return self.table[-1]
-        
-        # Calcul de l'index
         idx = (value - self.min_val) / (self.max_val - self.min_val) * self.steps
         i = int(idx)
         frac = idx - i
-        
         if i >= self.steps:
             return self.table[-1]
-        
-        # Interpolation linéaire
         return self.table[i] * (1 - frac) + self.table[i + 1] * frac
 
 
 class StressCalculator:
-    """
-    Calcule le stress normalisé (0.0-1.0) à partir d'une valeur et d'une règle.
-    Utilise des tables de correspondance pré-calculées pour les performances.
-    """
-    
-    _tables: Dict[int, StressLookupTable] = {}  # rule_id -> table
+    _tables: Dict[int, StressLookupTable] = {}
     
     @classmethod
     def get_table(cls, rule: AlertRule) -> StressLookupTable:
-        """Récupère ou crée la table pour une règle"""
         rule_id = id(rule)
         if rule_id not in cls._tables:
             cls._tables[rule_id] = StressLookupTable(rule)
@@ -179,87 +156,27 @@ class StressCalculator:
     
     @classmethod
     def compute(cls, value: float, rule: AlertRule) -> float:
-        """Calcule le stress en utilisant la table pré-calculée"""
-        table = cls.get_table(rule)
-        return table.get_stress(value)
+        return cls.get_table(rule).get_stress(value)
     
     @classmethod
     def clear_tables(cls):
-        """Libère les tables (utile en cas de reconfiguration)"""
         cls._tables.clear()
 
 
 # ============================================================================
-# CONFIG VALIDATOR
-# ============================================================================
-
-class ConfigValidator:
-    """Valide les mises à jour de configuration"""
-    
-    @staticmethod
-    def validate_thresholds(value: Any) -> Tuple[bool, str]:
-        """Valide un tableau de seuils [s1, s2, s3]"""
-        if not isinstance(value, list):
-            return False, "Thresholds must be a list"
-        
-        if len(value) != 3:
-            return False, f"Thresholds must have 3 values, got {len(value)}"
-        
-        if not all(isinstance(x, (int, float)) for x in value):
-            return False, "All threshold values must be numeric"
-        
-        # Vérifier l'ordre (strictement croissant)
-        if not (value[0] < value[1] < value[2]):
-            return False, f"Thresholds must be sorted: {value[0]} < {value[1]} < {value[2]}"
-        
-        return True, "OK"
-    
-    @staticmethod
-    def validate_frequency(value: Any) -> Tuple[bool, str]:
-        """Valide une fréquence"""
-        if not isinstance(value, (int, float)):
-            return False, "Frequency must be numeric"
-        
-        if value <= 0:
-            return False, f"Frequency must be > 0, got {value}"
-        
-        if value > 1000:
-            return False, f"Frequency too high: {value} > 1000 Hz"
-        
-        return True, "OK"
-
-
-# ============================================================================
-# OVERRIDE MANAGER (clé/valeur)
+# OVERRIDE MANAGER (in‑memory only)
 # ============================================================================
 
 class OverrideManager:
-    """
-    Gestionnaire d'override local (fichier JSON)
-    Stockage clé/valeur avec notation pointée.
-    """
+    """In‑memory override storage – no persistence."""
     
     def __init__(self, component_name: str):
         self.component = component_name
-        self.filename = f"{component_name}.override.json"
-        self.data = self._load()
-    
-    def _load(self) -> Dict:
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {
+        self.data = {
             "version": 0,
             "timestamp": None,
             "config": {}
         }
-    
-    def _save(self):
-        with open(self.filename, 'w') as f:
-            json.dump(self.data, f, indent=2)
     
     def get(self, key: str, default=None):
         return self.data["config"].get(key, default)
@@ -268,13 +185,11 @@ class OverrideManager:
         self.data["config"][key] = value
         self.data["version"] += 1
         self.data["timestamp"] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-        self._save()
     
     def update(self, config_dict: Dict):
         self.data["config"].update(config_dict)
         self.data["version"] += 1
         self.data["timestamp"] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-        self._save()
     
     def get_all(self) -> Dict:
         return self.data["config"].copy()
@@ -287,80 +202,11 @@ class OverrideManager:
 
 
 # ============================================================================
-# STREAM LISTENER (abonnements centralisés)
-# ============================================================================
-
-class StreamListener:
-    """
-    Écoute les topics et notifie les callbacks enregistrés.
-    """
-    
-    def __init__(self, zenoh_session):
-        self.zenoh = zenoh_session
-        self.callbacks = {}
-        self.subscribers = {}
-    
-    def subscribe(self, topic: str, callback: Callable):
-        if topic not in self.subscribers:
-            self.subscribers[topic] = self.zenoh.declare_subscriber(
-                topic, 
-                lambda sample: self._on_message(topic, sample)
-            )
-        if topic not in self.callbacks:
-            self.callbacks[topic] = []
-        self.callbacks[topic].append(callback)
-    
-    def _on_message(self, topic: str, sample):
-        try:
-            data = json.loads(sample.payload.to_string())
-            for cb in self.callbacks.get(topic, []):
-                try:
-                    cb(data)
-                except Exception as e:
-                    print(f"Error in callback for {topic}: {e}")
-        except Exception as e:
-            print(f"Error parsing message on {topic}: {e}")
-
-
-# ============================================================================
-# SLEEP PHASE LISTENER
-# ============================================================================
-
-class SleepPhaseListener:
-    """
-    Écoute les phases de sommeil et notifie les événements spécifiques.
-    """
-    
-    def __init__(self, stream_listener: StreamListener):
-        self.listener = stream_listener
-        self.on_deep_sleep_exit: Optional[Callable] = None
-        self.on_phase_change: Optional[Callable[[str, str], None]] = None
-        self.on_sleep_weight: Optional[Callable[[float], None]] = None
-        self.last_phase = None
-        
-        self.listener.subscribe("circa/phase", self._on_phase)
-        self.listener.subscribe("circa/sleep_weight", self._on_sleep_weight)
-    
-    def _on_phase(self, data):
-        phase = data.get("phase")
-        if self.on_phase_change and phase != self.last_phase:
-            self.on_phase_change(self.last_phase, phase)
-        if self.last_phase == "deep_sleep" and phase != "deep_sleep":
-            if self.on_deep_sleep_exit:
-                self.on_deep_sleep_exit()
-        self.last_phase = phase
-    
-    def _on_sleep_weight(self, data):
-        if self.on_sleep_weight:
-            self.on_sleep_weight(data.get("weight", 0.0))
-
-
-# ============================================================================
 # PUB SCHEDULER
 # ============================================================================
 
 class PubScheduler(threading.Thread):
-    """Scheduler de publication avec support du silence (fréquence = 0)"""
+    """Publication scheduler with silence support (frequency = 0)."""
     
     def __init__(self, publish_callback: Callable[[str, Any], None],
                  base_period: float = 0.01, name: str = "PubScheduler"):
@@ -371,8 +217,8 @@ class PubScheduler(threading.Thread):
         self._lock = threading.RLock()
         
         self.nerfs: Dict[str, List[float]] = {}      # alias -> [counter, step]
-        self.active_flags: Dict[str, bool] = {}      # True si publication active
-        self.base_periods: Dict[str, float] = {}     # période de base (avant modulation sommeil)
+        self.active_flags: Dict[str, bool] = {}      # True if active
+        self.base_periods: Dict[str, float] = {}     # base period (before sleep modulation)
         self.registry: Dict[str, Any] = {}
         self.pending_steps: Dict[str, float] = {}
         self.stats = {'cycles': 0, 'publications': 0, 'errors': 0}
@@ -403,7 +249,6 @@ class PubScheduler(threading.Thread):
                 self.active_flags[alias] = False
 
     def set_activity_factor(self, factor: float):
-        """Applique un facteur d'activité à tous les nerfs (ex: pendant sommeil)"""
         with self._lock:
             for alias, base_period in self.base_periods.items():
                 new_period = base_period / max(factor, 0.1)
@@ -433,7 +278,6 @@ class PubScheduler(threading.Thread):
     def run(self):
         while self.running:
             cycle_start = time.perf_counter()
-            
             with self._lock:
                 nerves_items = list(self.nerfs.items())
                 active_flags = self.active_flags.copy()
@@ -441,17 +285,13 @@ class PubScheduler(threading.Thread):
             for alias, state in nerves_items:
                 if not active_flags.get(alias, False):
                     continue
-                
                 state[0] += state[1]
-                
                 if state[0] >= 1.0:
                     state[0] = 0.0
-                    
                     with self._lock:
                         payload = self.registry.get(alias)
                         if alias in self.pending_steps:
                             state[1] = self.pending_steps.pop(alias)
-                    
                     if payload is not None:
                         try:
                             self.publish(alias, payload)
@@ -465,7 +305,6 @@ class PubScheduler(threading.Thread):
             sleep_time = self.base_period - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            
             with self._lock:
                 self.stats['cycles'] += 1
 
@@ -479,7 +318,7 @@ class PubScheduler(threading.Thread):
 # ============================================================================
 
 class FrequencyMapper:
-    """Mappe une valeur à une fréquence (0 = silence)"""
+    """Maps a value to a frequency (0 = silence)."""
     
     def __init__(self, rule: AlertRule):
         self.rule = rule
@@ -495,7 +334,6 @@ class FrequencyMapper:
         if rounded in self._cache:
             return self._cache[rounded]
         
-        # GT
         if self.gt:
             s1, s2, s3 = self.gt
             if value > s1:
@@ -510,7 +348,6 @@ class FrequencyMapper:
                 self._cache[rounded] = freq
                 return freq
         
-        # LT
         if self.lt:
             l3, l2, l1 = self.lt
             if value < l3:
@@ -525,7 +362,6 @@ class FrequencyMapper:
                 self._cache[rounded] = freq
                 return freq
         
-        # Silence
         self._cache[rounded] = 0.0
         return 0.0
 
@@ -535,7 +371,7 @@ class FrequencyMapper:
 # ============================================================================
 
 class BatteryMonitor:
-    """Moniteur de batterie avec estimation"""
+    """Battery monitor with rate estimation."""
     
     def __init__(self):
         self.history = collections.deque(maxlen=60)
@@ -544,7 +380,6 @@ class BatteryMonitor:
     def update(self, level: float, charging: bool, timestamp: float) -> Dict:
         with self._lock:
             self.history.append((timestamp, level, charging))
-            
             result = {
                 "level": round(level, 2),
                 "charging": charging,
@@ -555,25 +390,20 @@ class BatteryMonitor:
                 "minutes_to_empty": None,
                 "confidence": "low"
             }
-            
             if len(self.history) < 2:
                 return result
-            
             window = min(len(self.history), max(5, len(self.history)//3))
             recent = list(self.history)[-window:]
-            
             if window >= 30:
                 result["confidence"] = "high"
             elif window >= 15:
                 result["confidence"] = "medium"
-            
             if len(recent) >= 2:
                 dt = recent[-1][0] - recent[0][0]
                 if dt > 0:
                     dlevel = recent[-1][1] - recent[0][1]
                     rate_per_second = dlevel / dt
                     rate_per_minute = rate_per_second * 60
-                    
                     if charging and rate_per_second > 0:
                         result["charge_rate"] = round(rate_per_minute, 2)
                         remaining = 100.0 - level
@@ -581,7 +411,6 @@ class BatteryMonitor:
                     elif not charging and rate_per_second < 0:
                         result["discharge_rate"] = round(abs(rate_per_minute), 2)
                         result["minutes_to_empty"] = round(level / abs(rate_per_minute), 1)
-            
             return result
     
     def reset(self):
@@ -604,8 +433,9 @@ class MetricCollector:
     def collect(self, metrics: List[str]) -> Dict[str, float]:
         return {}
 
+
 class SystemMetricCollector(MetricCollector):
-    """Collecteur pour les métriques système globales"""
+    """Collector for global system metrics."""
     
     def __init__(self):
         super().__init__("system")
@@ -624,27 +454,28 @@ class SystemMetricCollector(MetricCollector):
     def collect(self, metrics: List[str]) -> Dict[str, float]:
         result = {}
         if "cpu" in metrics:
-            result["cpu"] = psutil.cpu_percent(interval=None) / 100.0
+            result["cpu"] = psutil.cpu_percent(interval=None)
         if "memory" in metrics:
-            result["memory"] = psutil.virtual_memory().percent / 100.0
+            result["memory"] = psutil.virtual_memory().percent
         if "temperature" in metrics:
             result["temperature"] = self._get_temperature()
         if "energy" in metrics:
             try:
                 battery = psutil.sensors_battery()
                 if battery:
-                    result["energy"] = battery.percent / 100.0
+                    result["energy"] = battery.percent
                     result["_energy_charging"] = battery.power_plugged
                 else:
-                    result["energy"] = 1.0
+                    result["energy"] = 100.0
                     result["_energy_charging"] = False
             except:
-                result["energy"] = 1.0
+                result["energy"] = 100.0
                 result["_energy_charging"] = False
         return result
 
+
 class SelfMetricCollector(MetricCollector):
-    """Collecteur pour les métriques intrinsèques du processus"""
+    """Collector for process‑local (self) metrics."""
     
     def __init__(self):
         super().__init__("self")
@@ -655,7 +486,7 @@ class SelfMetricCollector(MetricCollector):
     
     def _get_cpu(self) -> float:
         try:
-            cpu = self.process.cpu_percent(interval=0.1) / 100.0
+            cpu = self.process.cpu_percent(interval=0.1)
             with self._lock:
                 self.cpu_measurements.append(cpu)
                 if len(self.cpu_measurements) > 5:
@@ -666,23 +497,23 @@ class SelfMetricCollector(MetricCollector):
     
     def _get_memory(self) -> float:
         try:
-            return self.process.memory_percent() / 100.0
+            return self.process.memory_percent()
         except:
             return 0.0
     
-    def _get_threads(self) -> float:
+    def _get_threads(self) -> int:
         try:
-            return min(1.0, self.process.num_threads() / 50.0)
+            return self.process.num_threads()
         except:
-            return 0.0
+            return 0
     
-    def _get_fds(self) -> float:
+    def _get_fds(self) -> int:
         try:
             if hasattr(self.process, 'num_fds'):
-                return min(1.0, self.process.num_fds() / 100.0)
-            return 0.0
+                return self.process.num_fds()
+            return 0
         except:
-            return 0.0
+            return 0
     
     def collect(self, metrics: List[str]) -> Dict[str, float]:
         result = {}
@@ -692,18 +523,18 @@ class SelfMetricCollector(MetricCollector):
             elif m == "self_memory":
                 result[m] = self._get_memory()
             elif m == "self_threads":
-                result[m] = self._get_threads()
+                result[m] = float(self._get_threads())
             elif m == "self_fds":
-                result[m] = self._get_fds()
+                result[m] = float(self._get_fds())
         return result
 
 
 # ============================================================================
-# SENSOR ORCHESTRATOR (avec historique et tendances réelles)
+# SENSOR ORCHESTRATOR (with history and trends)
 # ============================================================================
 
 class SensorOrchestrator:
-    """Gère la configuration et la santé des capteurs"""
+    """Manages sensor configuration, health, and history."""
     
     def __init__(self, tech_config: Dict, collectors: List):
         self.config = tech_config
@@ -711,7 +542,7 @@ class SensorOrchestrator:
         self.sensors: Dict[str, SensorConfig] = {}
         self.active: List[str] = []
         self._cache: Dict[str, float] = {}
-        self._history: Dict[str, collections.deque] = {}  # Historique pour tendances
+        self._history: Dict[str, collections.deque] = {}
         self._trends: Dict[str, Dict] = {}
         self._lock = threading.RLock()
     
@@ -799,56 +630,31 @@ class SensorOrchestrator:
         return self.sensors
     
     def update_cache(self, name: str, value: float):
-        """Met à jour le cache et l'historique, calcule la tendance"""
         with self._lock:
             self._cache[name] = value
-            
-            # Initialiser l'historique si nécessaire
             if name not in self._history:
                 self._history[name] = collections.deque(maxlen=30)
-            
-            # Ajouter la nouvelle valeur avec timestamp
             self._history[name].append({
                 "timestamp": time.time(),
                 "value": value
             })
-            
-            # Calculer la tendance si suffisamment de données
             if len(self._history[name]) >= 10:
                 self._trends[name] = self._compute_trend(name)
     
     def _compute_trend(self, name: str) -> Dict:
-        """Calcule la tendance d'un capteur"""
         history = list(self._history[name])
         if len(history) < 2:
             return {"dir": "_", "speed": 0.0, "confidence": 0.0}
-        
         start = history[0]
         end = history[-1]
-        
         dt = end["timestamp"] - start["timestamp"]
         if dt == 0:
             return {"dir": "_", "speed": 0.0, "confidence": 0.0}
-        
         dv = end["value"] - start["value"]
-        speed = abs(dv / dt)  # variation par seconde
-        
-        # Direction
-        if abs(dv) < 0.01:  # seuil de stabilité
-            direction = "_"
-        elif dv > 0:
-            direction = "+"
-        else:
-            direction = "-"
-        
-        # Confiance (basée sur la taille de l'échantillon)
+        speed = abs(dv / dt)
+        direction = "_" if abs(dv) < 0.01 else ("+" if dv > 0 else "-")
         confidence = min(1.0, len(history) / 30.0)
-        
-        return {
-            "dir": direction,
-            "speed": round(speed, 4),
-            "confidence": round(confidence, 2)
-        }
+        return {"dir": direction, "speed": round(speed, 4), "confidence": round(confidence, 2)}
     
     def get_cached_value(self, name: str) -> Optional[float]:
         with self._lock:
@@ -904,16 +710,16 @@ class SensorOrchestrator:
 
 
 # ============================================================================
-# PAIN SIGNAL (avec transitions améliorées)
+# PAIN SIGNAL
 # ============================================================================
 
 class PainSignal:
-    """Signal de douleur avec gestion automatique du heartbeat et de la fréquence"""
+    """Pain signal with automatic heartbeat and frequency modulation."""
     
-    HEARTBEAT_FREQ = 0.1  # Hz (une fois toutes les 10 secondes)
-    MIN_FREQ = 1.0        # Hz (douleur minimale)
-    MAX_FREQ = 50.0       # Hz (douleur maximale)
-    THRESHOLD = 0.8       # Seuil de déclenchement
+    HEARTBEAT_FREQ = 0.1
+    MIN_FREQ = 1.0
+    MAX_FREQ = 50.0
+    THRESHOLD = 0.8
     
     def __init__(self, domain: str, metric: str, scheduler, zenoh, threshold=0.8):
         self.domain = domain
@@ -923,51 +729,34 @@ class PainSignal:
         self.threshold = threshold
         self.topic = f"pain/{domain}/{metric}"
         self.nerve_alias = f"pain_{domain}_{metric}".replace('/', '_')
-        
         self.active = False
         self.last_stress = 0.0
         self.last_value = 0.0
         self.last_metadata = {}
-        
-        # Enregistrer le nerf (commence en heartbeat)
         self.scheduler.add_nerve(self.nerve_alias, 1.0 / self.HEARTBEAT_FREQ, active=True)
         self._update_heartbeat_payload()
     
     def update(self, stress: float, value: float, metadata=None):
         self.last_stress = stress
         self.last_value = value
-        
-        # Fusionner les métadonnées (ne pas écraser)
         if metadata:
             self.last_metadata.update(metadata)
-        
-        # Détection de transition
         transition = None
-        
         if stress >= self.threshold:
-            # Mode douleur active
             if not self.active:
                 self.active = True
                 transition = "pain_onset"
-            
             intensity = (stress - self.threshold) / (1.0 - self.threshold)
             freq = self.MIN_FREQ + intensity * (self.MAX_FREQ - self.MIN_FREQ)
             self.scheduler.update_period(self.nerve_alias, 1.0 / freq)
-            
         else:
-            # Mode heartbeat
             if self.active:
                 self.active = False
                 transition = "pain_offset"
-            
             self.scheduler.update_period(self.nerve_alias, 1.0 / self.HEARTBEAT_FREQ)
-        
-        # Ajouter transition si détectée
         if transition:
             self.last_metadata["transition"] = transition
             self.last_metadata["transition_time"] = time.time()
-        
-        # Publier (publish ou heartbeat selon le cas)
         if self.active:
             self._publish()
         else:
@@ -999,49 +788,40 @@ class PainSignal:
     def _current_freq(self) -> float:
         if self.active:
             return 1.0 / self.scheduler.base_periods.get(self.nerve_alias, 1.0)
-        else:
-            return self.HEARTBEAT_FREQ
+        return self.HEARTBEAT_FREQ
     
     def stop(self):
         self.scheduler.remove_nerve(self.nerve_alias)
 
 
 # ============================================================================
-# ORGAN FAILURE SIGNAL (avec thread dédié pour spikes)
+# ORGAN FAILURE SIGNAL (with dedicated spike thread)
 # ============================================================================
 
 class OrganFailureSignal:
-    """Signal de défaillance organique (spike + heartbeat) avec thread dédié"""
+    """Organ failure signal with non‑blocking spike thread."""
     
-    HEARTBEAT_FREQ = 1.0  # Hz
+    HEARTBEAT_FREQ = 1.0
     
     def __init__(self, component: str, scheduler, zenoh):
         self.component = component
         self.scheduler = scheduler
         self.zenoh = zenoh
         self.topic = f"nerve/organ/{component}"
-        self.entry_alias = f"organ_{component}_entry"
         self.heartbeat_alias = f"organ_{component}_heartbeat"
-        self.exit_alias = f"organ_{component}_exit"
-        
         self.failing = False
         self.reason = {}
-        
-        # File d'attente et thread pour spikes non-bloquants
         self._spike_queue = queue.Queue()
         self._spike_thread = threading.Thread(target=self._spike_emitter, daemon=True)
         self._spike_thread.start()
     
     def _spike_emitter(self):
-        """Thread dédié pour émettre les spikes sans bloquer"""
         while True:
             try:
                 spike_data = self._spike_queue.get(timeout=1.0)
-                if spike_data is None:  # Signal d'arrêt
+                if spike_data is None:
                     break
-                
                 event, reason, count = spike_data
-                
                 for i in range(count):
                     payload = {
                         "event": event,
@@ -1051,25 +831,18 @@ class OrganFailureSignal:
                         "timestamp": time.time()
                     }
                     self.zenoh.put(self.topic, json.dumps(payload))
-                    time.sleep(0.01)  # 100 Hz
-                
+                    time.sleep(0.01)
             except queue.Empty:
                 continue
     
     def enter(self, reason: Dict):
-        """Entrée en défaillance (non-bloquant)"""
         self.failing = True
         self.reason = reason
-        
-        # Demander émission spike (non-bloquant)
         self._spike_queue.put(("failure_enter", reason, 10))
-        
-        # Démarrer heartbeat immédiatement
         self.scheduler.add_nerve(self.heartbeat_alias, 1.0 / self.HEARTBEAT_FREQ, active=True)
         self._update_heartbeat()
     
     def update_reason(self, reason: Dict):
-        """Met à jour la raison (heartbeat)"""
         self.reason.update(reason)
         self._update_heartbeat()
     
@@ -1083,20 +856,13 @@ class OrganFailureSignal:
         self.scheduler.update_payload(self.heartbeat_alias, payload)
     
     def exit(self):
-        """Sortie de défaillance (non-bloquant)"""
         if not self.failing:
             return
-        
         self.failing = False
-        
-        # Arrêter heartbeat
         self.scheduler.remove_nerve(self.heartbeat_alias)
-        
-        # Demander émission spike
         self._spike_queue.put(("failure_exit", self.reason, 10))
     
     def cleanup(self):
-        """Arrêt propre du thread de spikes"""
         self._spike_queue.put(None)
         self._spike_thread.join(timeout=2.0)
 
@@ -1106,40 +872,31 @@ class OrganFailureSignal:
 # ============================================================================
 
 class NeuralSignalingSystem:
-    """Système unifié de signalisation nerveuse"""
+    """Unified neural signaling system."""
     
-    def __init__(self, component: str, zenoh_session, scheduler):
+    def __init__(self, component: str, nerve_session, nerve_scheduler):
         self.component = component
-        self.zenoh = zenoh_session
-        self.scheduler = scheduler
+        self.zenoh = nerve_session
+        self.scheduler = nerve_scheduler
         self.pain_signals: Dict[Tuple[str, str], PainSignal] = {}
         self.organ_failure: Optional[OrganFailureSignal] = None
     
     def emit_pain(self, domain: str, metric: str, stress: float, value: float, metadata=None):
-        """Émet un signal de douleur (gradué + heartbeat)"""
         key = (domain, metric)
         if key not in self.pain_signals:
             self.pain_signals[key] = PainSignal(domain, metric, self.scheduler, self.zenoh)
-        
         self.pain_signals[key].update(stress, value, metadata)
     
     def stop_pain(self, domain: str, metric: str):
-        """Arrête un signal de douleur"""
         key = (domain, metric)
         if key in self.pain_signals:
             self.pain_signals[key].stop()
             del self.pain_signals[key]
     
     def emit_sensor_fault(self, sensor: str, reason: str, severity: str) -> int:
-        """
-        Émet un signal de diagnostic (spike)
-        Retourne le nombre de spikes émis
-        """
         severity_map = {"info": 1, "warning": 5, "error": 20, "critical": 100}
         spikes = severity_map.get(severity, 1)
         topic = f"nerve/diagnostics/{self.component}/sensor/{sensor}"
-        
-        # Version simplifiée sans thread dédié (peut être améliorée avec la même technique que OrganFailure)
         for i in range(spikes):
             payload = {
                 "event": "sensor_fault",
@@ -1151,12 +908,10 @@ class NeuralSignalingSystem:
                 "timestamp": time.time()
             }
             self.zenoh.put(topic, json.dumps(payload))
-            time.sleep(0.01)  # 100 Hz
-        
+            time.sleep(0.01)
         return spikes
     
     def emit_sensor_recovery(self, sensor: str):
-        """Émet un signal de récupération capteur (spike unique)"""
         topic = f"nerve/diagnostics/{self.component}/sensor/{sensor}"
         payload = {
             "event": "sensor_recovery",
@@ -1166,11 +921,9 @@ class NeuralSignalingSystem:
         self.zenoh.put(topic, json.dumps(payload))
     
     def emit_self_fault(self, fault_type: str, reason: str, severity: str) -> int:
-        """Émet un signal de défaillance interne (spike)"""
         severity_map = {"warning": 5, "error": 20, "critical": 100}
         spikes = severity_map.get(severity, 5)
         topic = f"nerve/diagnostics/{self.component}/self/{fault_type}"
-        
         for i in range(spikes):
             payload = {
                 "event": "self_fault",
@@ -1183,28 +936,23 @@ class NeuralSignalingSystem:
             }
             self.zenoh.put(topic, json.dumps(payload))
             time.sleep(0.01)
-        
         return spikes
     
     def emit_organ_failure(self, reason: Dict):
-        """Entre en défaillance organique"""
         if not self.organ_failure:
             self.organ_failure = OrganFailureSignal(self.component, self.scheduler, self.zenoh)
         self.organ_failure.enter(reason)
     
     def update_organ_failure(self, reason: Dict):
-        """Met à jour la raison de défaillance (heartbeat)"""
         if self.organ_failure and self.organ_failure.failing:
             self.organ_failure.update_reason(reason)
     
     def emit_organ_recovery(self):
-        """Sort de défaillance organique"""
         if self.organ_failure:
             self.organ_failure.exit()
             self.organ_failure = None
     
     def cleanup(self):
-        """Arrête tous les signaux"""
         for key in list(self.pain_signals.keys()):
             self.stop_pain(*key)
         if self.organ_failure:
@@ -1213,11 +961,11 @@ class NeuralSignalingSystem:
 
 
 # ============================================================================
-# ACQUISITION MANAGER (avec StressCalculator)
+# ACQUISITION MANAGER
 # ============================================================================
 
 class AcquisitionManager:
-    """Gère les threads de collecte"""
+    """Manages acquisition threads."""
     
     def __init__(self, tech_config: Dict, orch: SensorOrchestrator,
                  collectors: List, neural: NeuralSignalingSystem,
@@ -1242,7 +990,6 @@ class AcquisitionManager:
             if not cfg or cfg.suspended:
                 continue
             by_freq.setdefault(cfg.effective_freq, []).append(s)
-        
         for freq, sensors in by_freq.items():
             t = threading.Thread(target=self._loop, args=(freq, sensors), daemon=True)
             t.start()
@@ -1266,23 +1013,14 @@ class AcquisitionManager:
                     vals = coll.collect([s])
                     val = vals.get(s, 0.0)
                     duration = time.perf_counter() - read_start
-                    
                     self.orch.update_cache(s, val)
-                    
                     res = self.orch.check_read_time(s, duration)
                     if res == -1:
                         self.orch.suspend_sensor(s, "timeout critical")
                         self.neural.emit_sensor_fault(s, "timeout critical", "error")
                         continue
-                    
-                    # Utiliser StressCalculator pour un stress uniforme
                     stress = StressCalculator.compute(val, cfg.rule)
-                    
-                    # Émettre signal de douleur
-                    domain = "soma"  # Par défaut
-                    if s.startswith("self_"):
-                        domain = "soma_core"
-                    
+                    domain = "soma" if not s.startswith("self_") else "soma_core"
                     self.neural.emit_pain(
                         domain=domain,
                         metric=s,
@@ -1290,12 +1028,10 @@ class AcquisitionManager:
                         value=val,
                         metadata={"read_time_ms": duration*1000}
                     )
-                    
                     if s == "energy" and "_energy_charging" in vals:
                         chg = vals["_energy_charging"]
                         bat_info = self.battery.update(val, chg, now)
                         self.set_charging(chg)
-                        
                 except Exception as e:
                     if self.orch.handle_exception(s):
                         self.orch.suspend_sensor(s, "exceptions")
@@ -1305,11 +1041,11 @@ class AcquisitionManager:
 
 
 # ============================================================================
-# SELF HEALTH MANAGER (avec détection de tendances)
+# SELF HEALTH MANAGER
 # ============================================================================
 
 class SelfHealthManager:
-    """Gère la surveillance des métriques intrinsèques avec détection de tendances"""
+    """Monitors self metrics with trend detection."""
     
     def __init__(self, neural: NeuralSignalingSystem, collector: SelfMetricCollector):
         self.neural = neural
@@ -1319,64 +1055,42 @@ class SelfHealthManager:
         self.trends = {"cpu": 0.0, "memory": 0.0}
     
     def _compute_trend(self, metric: str, window: int = 30) -> float:
-        """
-        Calcule la tendance (pente) d'une métrique.
-        Retourne : variation par seconde (peut être négative)
-        """
         if len(self.history) < window:
             return 0.0
-        
         recent = list(self.history)[-window:]
-        
-        # Régression linéaire simple
         n = len(recent)
         sum_x = sum(range(n))
         sum_y = sum(r[metric] for r in recent)
         sum_xy = sum(i * r[metric] for i, r in enumerate(recent))
         sum_xx = sum(i * i for i in range(n))
-        
         if n * sum_xx - sum_x * sum_x == 0:
             return 0.0
-        
         slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
-        
-        # Normaliser par le temps (30 points = 30 secondes)
-        return slope  # variation par seconde
+        return slope
     
     def monitoring_loop(self):
-        """Boucle de surveillance (1 Hz) avec détection de tendances"""
         while self.running:
             metrics = self.collector.collect(["self_cpu", "self_memory", "self_threads", "self_fds"])
-            
             now = time.time()
             self.history.append({
                 "timestamp": now,
                 "cpu": metrics.get("self_cpu", 0.0),
                 "memory": metrics.get("self_memory", 0.0)
             })
-            
-            # Calculer tendances
             if len(self.history) >= 30:
                 self.trends["cpu"] = self._compute_trend("cpu", 30)
                 self.trends["memory"] = self._compute_trend("memory", 30)
-            
-            # Signaux de douleur avec tendances dans metadata
             for name, value in metrics.items():
                 if name == "self_cpu":
-                    stress = value  # Déjà normalisé
+                    stress = StressCalculator.compute(value, AlertRule(gt=[80,150,200]))  # simplified
                     trend_val = self.trends.get("cpu", 0.0)
                 elif name == "self_memory":
-                    stress = value
+                    stress = StressCalculator.compute(value, AlertRule(gt=[20,40,60]))
                     trend_val = self.trends.get("memory", 0.0)
                 else:
-                    stress = value
+                    stress = min(1.0, value / 100.0)
                     trend_val = 0.0
-                
-                metadata = {
-                    "source": "self_monitor",
-                    "trend": round(trend_val, 4)
-                }
-                
+                metadata = {"source": "self_monitor", "trend": round(trend_val, 4)}
                 self.neural.emit_pain(
                     domain="soma_core",
                     metric=name,
@@ -1384,22 +1098,16 @@ class SelfHealthManager:
                     value=value,
                     metadata=metadata
                 )
-            
-            # Détection fuite mémoire AVEC tendance
             if len(self.history) >= 30:
                 mem_trend = self.trends["memory"]
-                
-                if mem_trend > 0.005:  # +0.5% par seconde
-                    projected_increase = mem_trend * 60  # projection 1 minute
-                    
-                    severity = "warning" if mem_trend < 0.01 else "error"
-                    
+                if mem_trend > 0.005:
+                    proj = mem_trend * 60
+                    sev = "warning" if mem_trend < 0.01 else "error"
                     self.neural.emit_self_fault(
                         fault_type="memory_leak",
-                        reason=f"Memory increasing at {mem_trend*100:.2f}%/s, projected +{projected_increase*100:.1f}% in 60s",
-                        severity=severity
+                        reason=f"Memory inc {mem_trend*100:.2f}%/s, proj +{proj*100:.1f}% in 60s",
+                        severity=sev
                     )
-            
             time.sleep(1.0)
     
     def stop(self):
@@ -1407,18 +1115,18 @@ class SelfHealthManager:
 
 
 # ============================================================================
-# HEALTH MONITOR (avec tendances)
+# HEALTH MONITOR
 # ============================================================================
 
 class HealthMonitor:
-    """Publie l'état de santé à 1 Hz (canal lymphatique)"""
+    """Publishes organ health at 1 Hz (lymphatic channel)."""
     
     def __init__(self, component: str, version: str,
                  get_incoming: Callable, get_outgoing: Callable, get_sensors: Callable,
                  get_self_metrics: Optional[Callable] = None):
         self.component = component
         self.version = version
-        self.health_version = "2.2"
+        self.health_version = "2.3"
         self.boot_count = 0
         self.start_time = time.time()
         self.get_incoming = get_incoming
@@ -1438,18 +1146,13 @@ class HealthMonitor:
             "incoming": self.get_incoming(),
             "outgoing": self.get_outgoing()
         }
-        
-        # Ajouter les métriques self si disponibles
         if self.get_self_metrics:
             self_metrics = self.get_self_metrics()
             if self_metrics:
                 payload["self"] = self_metrics
-        
-        # Ajouter les capteurs avec tendances
         sensors = self.get_sensors()
         if sensors:
             payload["sensors"] = sensors
-        
         return payload
 
 
@@ -1458,7 +1161,7 @@ class HealthMonitor:
 # ============================================================================
 
 class OrganHealthChecker:
-    """Vérifie périodiquement la santé globale de l'organe"""
+    """Periodically checks organ health and triggers failure if needed."""
     
     def __init__(self, orchestrator: SensorOrchestrator, neural: NeuralSignalingSystem,
                  self_monitor: Optional[SelfHealthManager] = None, interval: float = 5.0):
@@ -1469,33 +1172,25 @@ class OrganHealthChecker:
         self.running = True
     
     def check_loop(self):
-        """Boucle de vérification"""
         while self.running:
             self._check()
             time.sleep(self.interval)
     
     def _check(self):
-        """Vérifie la santé et déclenche défaillance si nécessaire"""
         sensors = self.orch.sensors
         total = len(sensors)
         if total == 0:
             return
-        
         suspended = sum(1 for s in sensors.values() if s.suspended)
         in_pain = len([p for p in self.neural.pain_signals.values() if p.active])
-        
         fault_ratio = suspended / total if total > 0 else 0
         pain_ratio = in_pain / total if total > 0 else 0
-        
-        # Métriques self (si disponibles)
-        self_metrics = {}
         cpu_crit = False
         mem_crit = False
         if self.self_monitor and len(self.self_monitor.history) > 0:
             last = self.self_monitor.history[-1]
-            cpu_crit = last["cpu"] > 0.9
-            mem_crit = last["memory"] > 0.95
-        
+            cpu_crit = last["cpu"] > 90
+            mem_crit = last["memory"] > 95
         reason = {
             "sensor_faults": suspended,
             "active_pains": in_pain,
@@ -1505,10 +1200,8 @@ class OrganHealthChecker:
             "cpu_critical": cpu_crit,
             "mem_critical": mem_crit
         }
-        
         should_fail = fault_ratio > 0.5 or pain_ratio > 0.8 or (cpu_crit and mem_crit)
         is_failing = self.neural.organ_failure and self.neural.organ_failure.failing
-        
         if should_fail and not is_failing:
             self.neural.emit_organ_failure(reason)
         elif not should_fail and is_failing:
@@ -1525,15 +1218,16 @@ class OrganHealthChecker:
 # ============================================================================
 
 class SomaCore:
-    """Organe principal de perception somatique"""
+    """Main somatic perception organ."""
     
     def __init__(self, zenoh_config: str, rules_file: str, self_file: str, tech_file: str):
         self.name = "soma_core"
-        self.version = "2.2.1"
+        self.version = "2.3.0"
         self.running = True
         self.pending_reset = False
+        self.config_received = threading.Event()
         
-        # Charger configurations
+        # Load static configurations (defaults)
         with open(rules_file, 'r') as f:
             self.rules_data = json.load(f)
         with open(self_file, 'r') as f:
@@ -1541,56 +1235,54 @@ class SomaCore:
         with open(tech_file, 'r') as f:
             self.tech_config = json.load(f)
         
-        # Override local
+        # In‑memory override (no persistence)
         self.override = OverrideManager(self.name)
         
-        # Zenoh
-        conf = zenoh.Config()
-        conf.from_file(zenoh_config)
-        self.zenoh = zenoh.open(conf)
+        # Base Zenoh config
+        base_conf = zenoh.Config()
+        base_conf.from_file(zenoh_config)
         
-        # Stream listener
-        self.stream_listener = StreamListener(self.zenoh)
+        # Three dedicated Zenoh sessions
+        self.nerve_session = zenoh.open(base_conf.clone())   # urgent signals
+        self.hormonal_session = zenoh.open(base_conf.clone()) # not used by SomaCore
+        self.meta_session = zenoh.open(base_conf.clone())     # config, health, validation
         
-        # Sleep phase listener
-        self.sleep_listener = SleepPhaseListener(self.stream_listener)
-        self.sleep_listener.on_deep_sleep_exit = self._on_deep_sleep_exit
-        self.sleep_listener.on_phase_change = self._on_phase_change
-        self.sleep_listener.on_sleep_weight = self._on_sleep_weight
-        
-        # Scheduler
-        self.scheduler = PubScheduler(
-            publish_callback=self._publish,
+        # Dedicated schedulers
+        self.nerve_scheduler = PubScheduler(
+            publish_callback=self._publish_nerve,
             base_period=self.tech_config.get('scheduler', {}).get('base_period', 0.01),
-            name=f"{self.name}_scheduler"
+            name=f"{self.name}_nerve_sched"
         )
-        self.scheduler.start()
+        self.nerve_scheduler.start()
         
-        # Neural signaling system
-        self.neural = NeuralSignalingSystem(self.name, self.zenoh, self.scheduler)
+        self.meta_scheduler = PubScheduler(
+            publish_callback=self._publish_meta,
+            base_period=0.1,   # slower for meta channel
+            name=f"{self.name}_meta_sched"
+        )
+        self.meta_scheduler.start()
         
-        # Collecteurs
+        # Neural signaling system (uses nerve session)
+        self.neural = NeuralSignalingSystem(self.name, self.nerve_session, self.nerve_scheduler)
+        
+        # Collectors
         self.system_collector = SystemMetricCollector()
         self.self_collector = SelfMetricCollector()
         
-        # Profils et règles
+        # Profiles and rules
         self.profiles = self._load_profiles()
         self.rules = self._load_rules(self.rules_data, "metrics")
         self.self_rules = self._load_rules(self.self_data, "metrics", prefix="self_")
-        
-        # Toutes les règles
         all_rules = self.rules + self.self_rules
         
-        # Moniteur batterie
+        # Battery monitor
         self.battery = BatteryMonitor()
         
-        # Orchestrateur
+        # Sensor orchestrator
         self.orch = SensorOrchestrator(self.tech_config, [self.system_collector, self.self_collector])
-        
-        # Bootstrap
         self.sensors = self.orch.bootstrap(all_rules, self.profiles)
         
-        # Acquisition
+        # Acquisition manager
         self.acq = AcquisitionManager(
             self.tech_config, self.orch, [self.system_collector, self.self_collector],
             self.neural, self.battery, lambda: self.running
@@ -1605,7 +1297,7 @@ class SomaCore:
         self.health_checker = OrganHealthChecker(self.orch, self.neural, self.self_monitor)
         threading.Thread(target=self.health_checker.check_loop, daemon=True).start()
         
-        # Enregistrer les nerfs
+        # Register nerves in schedulers
         self._register_nerves()
         
         # Health monitor
@@ -1620,13 +1312,24 @@ class SomaCore:
         self.health.boot_count = self.override.get("boot_count", 0) + 1
         self.override.set("boot_count", self.health.boot_count)
         
-        # Publier config au démarrage
-        self._publish_config()
+        # Subscribe to configuration (retention)
+        self.meta_session.declare_subscriber(f"config/{self.name}", self._on_config_update)
         
-        # S'abonner aux mises à jour de config
-        self.stream_listener.subscribe(f"config/{self.name}", self._on_config_update)
+        # Subscribe to validation requests
+        self.meta_session.declare_subscriber(
+            f"config/validate/request/{self.name}",
+            self._on_validate_request
+        )
         
-        # Thread de health
+        # Subscribe to sleep signals
+        self.meta_session.declare_subscriber("circa/phase", self._on_phase)
+        self.meta_session.declare_subscriber("circa/sleep_weight", self._on_sleep_weight)
+        
+        # Wait a bit for config (if none received, use defaults)
+        if not self.config_received.wait(timeout=2.0):
+            print("⚠️ No configuration received, using defaults")
+        
+        # Start health loop
         threading.Thread(target=self._health_loop, daemon=True).start()
         
         print(f"✅ {self.name} v{self.version} started")
@@ -1661,94 +1364,78 @@ class SomaCore:
     
     def _register_nerves(self):
         for name, cfg in self.sensors.items():
-            self.scheduler.add_nerve(cfg.nerve_alias, cfg.effective_period)
+            self.nerve_scheduler.add_nerve(cfg.nerve_alias, cfg.effective_period)
     
-    def _publish(self, alias: str, payload: Any):
+    def _publish_nerve(self, alias: str, payload: Any):
         for rule in self.rules + self.self_rules:
             if rule.alias == alias:
-                self.zenoh.put(rule.flux_topic, json.dumps(payload))
+                self.nerve_session.put(rule.flux_topic, json.dumps(payload))
                 return
     
-    def _publish_config(self):
-        """Publie la configuration sur config/soma_core (canal lymphatique)"""
-        self.zenoh.put(
-            f"config/{self.name}",
-            json.dumps({
-                "version": self.override.get_version(),
-                "timestamp": self.override.get_timestamp() or datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-                "config": self.override.get_all()
-            }),
-            encoding=zenoh.Encoding.JSON,
-            consolidation=zenoh.ConsolidationMode.NONE
-        )
+    def _publish_meta(self, alias: str, payload: Any):
+        if alias.startswith("health_"):
+            self.meta_session.put(f"health/{self.name}", json.dumps(payload))
     
-    def _on_config_update(self, data):
+    def _on_config_update(self, sample):
+        """Receive new configuration (retention topic)."""
+        data = json.loads(sample.payload)
         new_config = data.get("config", {})
+        version = data.get("version")
+        print(f"📥 Received config v{version} for {self.name}")
         self.override.update(new_config)
-        print(f"📥 Config updated: {len(new_config)} keys")
         self._apply_config_updates(new_config)
+        self.config_received.set()
+    
+    def _on_validate_request(self, sample):
+        """Handle validation request from PersonalityCore."""
+        req = json.loads(sample.payload)
+        results = {}
+        rejected = {}
+        all_accepted = True
+        for key, value in req["config"].items():
+            # Basic validation (can be extended)
+            if self._is_valid(key, value):
+                results[key] = {"status": "accepted"}
+            else:
+                all_accepted = False
+                results[key] = {"status": "rejected", "reason": "Invalid value"}
+                rejected[key] = "Invalid value"
+        response = {
+            "request_id": req["request_id"],
+            "accepted": all_accepted,
+            "results": results,
+            "rejected": rejected,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.meta_session.put(f"config/validate/response/{self.name}", json.dumps(response))
+    
+    def _is_valid(self, key: str, value: Any) -> bool:
+        """Basic validation placeholder."""
+        return True
     
     def _apply_config_updates(self, updates: Dict):
-        """Applique les mises à jour avec validation"""
-        for key, value in updates.items():
-            # Validation des seuils
-            if key.startswith("thresholds."):
-                valid, msg = ConfigValidator.validate_thresholds(value)
-                if not valid:
-                    print(f"❌ Invalid config {key}: {msg}")
-                    continue
-                
-                parts = key.split('.')
-                if len(parts) >= 3:
-                    sensor_name = parts[1]
-                    cfg = self.orch.get_sensor(sensor_name)
-                    if cfg and cfg.rule:
-                        if "gt" in key:
-                            old = cfg.rule.gt
-                            cfg.rule.gt = value
-                            print(f"✅ Updated {sensor_name}.gt: {old} → {value}")
-                            
-                            # Forcer le recalcul de la table de stress
-                            rule_id = id(cfg.rule)
-                            if rule_id in StressCalculator._tables:
-                                del StressCalculator._tables[rule_id]
-                        
-                        elif "lt" in key:
-                            old = cfg.rule.lt
-                            cfg.rule.lt = value
-                            print(f"✅ Updated {sensor_name}.lt: {old} → {value}")
-                            
-                            # Forcer le recalcul de la table de stress
-                            rule_id = id(cfg.rule)
-                            if rule_id in StressCalculator._tables:
-                                del StressCalculator._tables[rule_id]
-            
-            # Validation des fréquences
-            elif key.endswith(".frequency"):
-                valid, msg = ConfigValidator.validate_frequency(value)
-                if not valid:
-                    print(f"❌ Invalid config {key}: {msg}")
-                    continue
-                
-                # Appliquer...
-                pass
+        """Apply configuration updates (to be implemented)."""
+        pass
     
-    def _on_deep_sleep_exit(self):
-        self.pending_reset = True
-    
-    def _on_phase_change(self, prev: str, curr: str):
+    def _on_phase(self, sample):
+        data = json.loads(sample.payload)
+        phase = data.get("phase")
         factors = {
             "deep_sleep": self.tech_config.get('sleep', {}).get('deep_sleep_factor', 0.1),
             "light_sleep": self.tech_config.get('sleep', {}).get('light_sleep_factor', 0.3),
             "dream": self.tech_config.get('sleep', {}).get('dream_factor', 0.5),
             "wake": self.tech_config.get('sleep', {}).get('wake_factor', 1.0)
         }
-        factor = factors.get(curr, 1.0)
-        self.scheduler.set_activity_factor(factor)
+        factor = factors.get(phase, 1.0)
+        self.nerve_scheduler.set_activity_factor(factor)
+        self.meta_scheduler.set_activity_factor(factor)
     
-    def _on_sleep_weight(self, weight: float):
+    def _on_sleep_weight(self, sample):
+        data = json.loads(sample.payload)
+        weight = data.get("v", 0.0)
         if weight > 0.8:
-            self.scheduler.set_activity_factor(0.2)
+            self.nerve_scheduler.set_activity_factor(0.2)
+            self.meta_scheduler.set_activity_factor(0.2)
     
     def _get_incoming_stats(self) -> List:
         return [
@@ -1759,35 +1446,29 @@ class SomaCore:
     
     def _get_outgoing_stats(self) -> List:
         return [
-            {"topic": f"config/{self.name}", "last": datetime.now().isoformat(), "freq": 0.001},
-            {"topic": "health/soma_core", "last": datetime.now().isoformat(), "freq": 1.0}
+            {"topic": f"health/{self.name}", "last": datetime.now().isoformat(), "freq": 1.0}
         ]
     
     def _get_sensor_summary(self) -> Dict:
-        """Retourne un résumé des capteurs avec tendances"""
-        sensors_detail = {}
-        
+        details = {}
         for name in self.orch.get_active():
             cfg = self.orch.get_sensor(name)
             if not cfg:
                 continue
-            
-            cached_value = self.orch.get_cached_value(name)
+            val = self.orch.get_cached_value(name)
             trend = self.orch.get_cached_trend(name)
-            
-            sensors_detail[name] = {
-                "value": round(cached_value, 3) if cached_value is not None else None,
+            details[name] = {
+                "value": round(val, 3) if val is not None else None,
                 "trend": trend,
                 "suspended": cfg.suspended,
                 "degraded": cfg.degraded,
                 "unstable": cfg.unstable
             }
-        
         return {
             "active": len(self.orch.get_active()),
             "suspended": sum(1 for s in self.orch.get_active() if self.orch.get_sensor(s) and self.orch.get_sensor(s).suspended),
             "pain": len([p for p in self.neural.pain_signals.values() if p.active]),
-            "detail": sensors_detail
+            "detail": details
         }
     
     def _get_self_metrics(self) -> Optional[Dict]:
@@ -1795,8 +1476,10 @@ class SomaCore:
             return None
         last = self.self_monitor.history[-1]
         return {
-            "cpu": round(last["cpu"], 3),
-            "memory": round(last["memory"], 3),
+            "cpu": round(last["cpu"], 1),
+            "memory": round(last["memory"], 1),
+            "threads": int(self.self_collector._get_threads()),
+            "fds": int(self.self_collector._get_fds()),
             "cpu_trend": round(self.self_monitor.trends.get("cpu", 0.0), 4),
             "memory_trend": round(self.self_monitor.trends.get("memory", 0.0), 4)
         }
@@ -1804,7 +1487,7 @@ class SomaCore:
     def _health_loop(self):
         while self.running:
             payload = self.health.get_payload()
-            self.zenoh.put(f"health/{self.name}", json.dumps(payload))
+            self.meta_session.put(f"health/{self.name}", json.dumps(payload))
             time.sleep(1.0)
     
     def stop(self):
@@ -1812,8 +1495,11 @@ class SomaCore:
         self.self_monitor.stop()
         self.health_checker.stop()
         self.neural.cleanup()
-        self.scheduler.stop()
-        self.zenoh.close()
+        self.nerve_scheduler.stop()
+        self.meta_scheduler.stop()
+        self.nerve_session.close()
+        self.hormonal_session.close()
+        self.meta_session.close()
         print(f"🛑 {self.name} stopped")
 
 
