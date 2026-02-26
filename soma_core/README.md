@@ -7,7 +7,7 @@
 **SomaCore** is a bio‑inspired sensor acquisition **organ**. It is one of the many organs that constitute a synthetic entity within the **AwareEntityFramework (AEF)**. Its role is to continuously monitor:
 
 - **External sensors** : hardware metrics (CPU, memory, temperature, battery)
-- **Internal sensors** : its own process metrics (CPU, memory, threads, file descriptors)
+- **Internal sensors** : its own process metrics (CPU, memory, threads)
 
 It translates these readings into **frequency‑modulated nerve signals** using three distinct types of neural signaling, and communicates its state via **lymphatic channels** (health and configuration). It receives dynamic configuration via a dedicated retention topic and can validate proposed changes before acceptance.
 
