@@ -1,0 +1,41 @@
+{
+  "gem": {
+    "identifiant": "shirka_001",
+    "nom": "Shirka",
+    "date_naissance": "2024-01-01T00:00:00",
+    "version": 1,
+    
+    "tempo_base": 0.65,
+    "intensite_base": 0.7,
+    "grace": 0.5,
+    "reactivite": 0.8,
+    
+    "curiosite_mots": 0.6,
+    "curiosite_verbes": 0.5,
+    "curiosite_personnes": 0.9,
+    "curiosite_lieux": 0.8,
+    "curiosite_faits": 0.7,
+    
+    "affinites_litterature": {
+      "roman": 0.8,
+      "poesie": 0.4,
+      "theatre": 0.6,
+      "essai": 0.7,
+      "biographie": 0.5,
+      "science_fiction": 0.3,
+      "fantastique": 0.4,
+      "policier": 0.6,
+      "classique": 0.9
+    },
+    
+    "duree_memoire_litterature": 30,
+    "duree_memoire_episodique": 90,
+    "duree_memoire_sociale": 365,
+    
+    "style_prefere": "narratif",
+    "seuil_curiosite": 0.7,
+    
+    "signature_type": "sha256",
+    "signature_valeur": "a47f2c3d8e1b9a5c6d0e3f4a2b8c7d1e9f0a3b6c5d8e7f2a1c4b9d0e3f6a8c5b1d7"
+  }
+}
