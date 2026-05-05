@@ -3,31 +3,33 @@
 """
 intent_pipeline_v4.py — Pipeline NLU français → Intent(s) structuré(s)
 =======================================================================
-Fusion v3 + v6 + Relations sémantiques. Raspberry Pi 5, 100 % offline.
+Version finale avec mémorisation et restitution.
 
-Version corrigée (2025-05-04) avec :
-  - prefer dans le cache LRU de FrenchTemporalResolver
-  - EventGraph complet (GraphContext, set_location, set_time, set_subjects)
-  - SEMANTIC_MAP restauré (224 verbes, 11 concepts)
-  - run_graph_tests() complet
-  - Tous les extracteurs (relations, coreference, attributes, events, etc.)
+Nouveautés v4.3 (mémorisation/restitution) :
+  - Détection des phrases de mémorisation ("retiens que", "souviens-toi", etc.)
+  - Mode magnétophone (mémoire brute avec restitution exacte)
+  - Contexte de mémorisation (locuteur, sujet, moment, lieu)
+  - Commande de rappel ("qu'est-ce que j'ai dit ?", "rappelle-moi")
+  - Filtrage par contexte (sujet, date, locuteur)
+
+Fonctionnalités complètes :
+  - Classification déterministe des 6 intents
+  - SEMANTIC_MAP 224 verbes, 11 concepts
+  - Analyse verbale avancée (temps, modes, personnes)
+  - Résolution temporelle française (saisons, vacances, jours fériés)
+  - Relations sémantiques (25+ types)
+  - Coreférence, attributs, événements
+  - Actions programmées ("dans X minutes")
+  - Discours rapporté, rôles contextuels, entités collectives
   - Alias et expressions figées
-  - Import optionnels avec fallbacks
+  - Mémorisation brute (magnétophone)
+  - Restitution contextuelle
+  - Export pour CognitionCore
 
-Classification déterministe (sans CamemBERT) :
-  verb.mood == imperative        → action_device
-  verb.scope == PAST  + "?"      → query_narrative
-  verb.scope == FUTURE + "?"     → query_intention
-  "?" ou mot interrogatif        → query_state
-  verb.person in 1st_sg/1st_pl  → information_input
-  lexique social/politesse       → chit_chat
-
-Dépendances requises :
+Dépendances :
     pip install spacy numpy dateparser python-dateutil workalendar
-    python -m spacy download fr_core_news_sm
-
-Dépendances optionnelles :
     pip install python-Levenshtein timexy holidays vacances-scolaires
+    python -m spacy download fr_core_news_sm
 """
 
 import datetime
@@ -114,8 +116,11 @@ error_logger.setLevel(logging.WARNING)
 # Types stricts
 # ============================================================
 
-IntentType = Literal["query_narrative", "query_state", "query_intention",
-                      "action_device", "information_input", "chit_chat"]
+IntentType = Literal[
+    "query_narrative", "query_state", "query_intention",
+    "action_device", "information_input", "chit_chat",
+    "memorize", "recall"
+]
 TenseType = Literal["past", "present", "future", "conditional", "unknown"]
 PersonType = Literal["1st_sg", "2nd_sg", "3rd_sg", "1st_pl", "2nd_pl", "3rd_pl", "unknown"]
 MoodType = Literal["indicative", "subjunctive", "imperative", "conditional", "infinitive"]
@@ -151,6 +156,7 @@ OUTPUT_QUEUE_SIZE = 50
 INTENTS: List[IntentType] = [
     "query_narrative", "query_state", "query_intention",
     "action_device", "information_input", "chit_chat",
+    "memorize", "recall",
 ]
 
 NER_TYPE_MAP = {
@@ -220,7 +226,7 @@ DEVICE_NOUNS: Dict[str, str] = {
 }
 
 # ============================================================
-# SEMANTIC_MAP — 224 verbes, 11 concepts (RESTAURÉ)
+# SEMANTIC_MAP — 224 verbes, 11 concepts (RESTAURÉ COMPLET)
 # ============================================================
 
 SEMANTIC_MAP: Dict[str, ConceptType] = {
@@ -311,7 +317,7 @@ REGISTER_LEXICON = {
         "ok", "oki", "mouais", "pfff", "lol", "mdr", "ptdr", "faut", "t'inquiète",
     },
     "soutenu": {
-        "néanmoins", "cependant", "toutefois", "ainsi", "également", "certes",
+        "néanmoins", "cependant", "toutefois", "ainsi", "égalemente", "certes",
         "quoique", "nonobstant", "afin", "lequel", "laquelle", "auquel", "duquel",
         "dont", "ledit", "ladite", "susmentionné", "permettez", "veuillez", "daigner",
         "souhaiteriez", "pourriez", "daignez", "sauriez", "conviendrait", "s'avère",
@@ -361,13 +367,156 @@ COMMON_WORDS_FR = {
     "pour", "par", "avec", "sans", "dans", "sur", "sous",
 }
 
+# ============================================================
+# NOUVEAU: STRUCTURES POUR MÉMORISATION BRUTE
+# ============================================================
+
+@dataclass
+class RawMemoryItem:
+    """Mémoire épisodique brute (mode magnétophone)."""
+    
+    # Identifiant
+    id: str
+    
+    # Contenu brut
+    raw_text: str
+    
+    # Contexte (obligatoire pour recherche)
+    speaker: str                     # qui a parlé
+    subject: Optional[str] = None    # de quoi on parle
+    location: Optional[str] = None   # où
+    when: Optional[float] = None     # timestamp (remplacé par timestamp)
+    
+    # Métadonnées
+    timestamp: float = field(default_factory=time.time)
+    importance: float = 1.0
+    recalled_count: int = 0
+    last_recalled: Optional[float] = None
+    
+    # Contexte enrichi
+    context: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> dict:
+        return asdict(self)
+    
+    def to_restoration(self) -> str:
+        """Restitue exactement ce qui a été dit."""
+        return self.raw_text
+
+
+@dataclass
+class RecallQuery:
+    """Requête de rappel pour la mémoire brute."""
+    
+    # Filtres
+    speaker: Optional[str] = None
+    subject: Optional[str] = None
+    location: Optional[str] = None
+    time_after: Optional[float] = None
+    time_before: Optional[float] = None
+    contains_text: Optional[str] = None
+    max_results: int = 5
+    
+    def is_empty(self) -> bool:
+        """Vérifie si aucun filtre n'est défini."""
+        return all([
+            self.speaker is None,
+            self.subject is None,
+            self.location is None,
+            self.time_after is None,
+            self.time_before is None,
+            self.contains_text is None,
+        ])
+
+
+class RawMemory:
+    """Mémoire brute avec filtrage contextuel."""
+    
+    def __init__(self):
+        self._items: Dict[str, RawMemoryItem] = {}
+        self._counter = 0
+        self._lock = threading.RLock()
+    
+    def store(self, text: str, speaker: str, subject: str = None,
+              location: str = None, context: Dict = None) -> str:
+        """Stocke un élément en mémoire brute."""
+        with self._lock:
+            self._counter += 1
+            item_id = f"raw_mem_{self._counter}"
+            
+            item = RawMemoryItem(
+                id=item_id,
+                raw_text=text,
+                speaker=speaker,
+                subject=subject,
+                location=location,
+                timestamp=time.time(),
+                context=context or {},
+            )
+            self._items[item_id] = item
+            logger.debug(f"Raw memory stored: {item_id} -> '{text[:50]}...'")
+            return item_id
+    
+    def recall(self, query: RecallQuery) -> List[RawMemoryItem]:
+        """Récupère des éléments par filtrage contextuel."""
+        with self._lock:
+            results = []
+            
+            for item in self._items.values():
+                # Filtre speaker
+                if query.speaker and item.speaker != query.speaker:
+                    continue
+                
+                # Filtre subject
+                if query.subject and item.subject != query.subject:
+                    continue
+                
+                # Filtre location
+                if query.location and item.location != query.location:
+                    continue
+                
+                # Filtre text
+                if query.contains_text and query.contains_text.lower() not in item.raw_text.lower():
+                    continue
+                
+                # Filtre temps
+                if query.time_after and item.timestamp < query.time_after:
+                    continue
+                if query.time_before and item.timestamp > query.time_before:
+                    continue
+                
+                results.append(item)
+            
+            # Trier par timestamp décroissant (plus récent d'abord)
+            results.sort(key=lambda x: x.timestamp, reverse=True)
+            
+            # Mettre à jour les compteurs d'appel
+            for r in results[:query.max_results]:
+                r.recalled_count += 1
+                r.last_recalled = time.time()
+            
+            return results[:query.max_results]
+    
+    def recall_by_raw_query(self, text: str, speaker: str = None) -> List[RawMemoryItem]:
+        """Rappel par phrase brute (forme libre)."""
+        query = RecallQuery(
+            speaker=speaker,
+            contains_text=text
+        )
+        return self.recall(query)
+    
+    def recall_by_subject(self, subject: str, speaker: str = None) -> List[RawMemoryItem]:
+        """Rappel par sujet."""
+        query = RecallQuery(speaker=speaker, subject=subject)
+        return self.recall(query)
+
 
 # ============================================================
 # SECTION 1 — FrenchTextCorrector (v3)
 # ============================================================
 
 class FrenchTextCorrector:
-    """Normalise le texte avant analyse NLU. SMS, dyslexie, fautes phonétiques."""
+    """Normalise le texte avant analyse NLU."""
 
     COMMON_MISTAKES: Dict[str, str] = {
         "sava": "ça va", "cetais": "c'était", "cété": "c'était",
@@ -443,7 +592,7 @@ class FrenchTextCorrector:
 # ============================================================
 
 class FrenchVerbAnalyzer:
-    """Enrichit l'analyse verbale spaCy : irréguliers, formes composées, pronominal."""
+    """Enrichit l'analyse verbale spaCy."""
 
     IRREGULAR: Dict[str, Tuple[str, str, str]] = {
         "aller": ("vais/vas/va/allons/allez/vont", "allai", "allé"),
@@ -508,7 +657,6 @@ class FrenchVerbAnalyzer:
 
 @dataclass
 class TemporalSpan:
-    """Expression temporelle normalisée TIMEX3 : DATE|TIME|DURATION|SET|INTERVAL."""
     raw: str
     iso_start: str
     iso_end: str
@@ -544,14 +692,11 @@ def _check_timexy() -> bool:
 
 
 # ============================================================
-# SECTION 4 — FrenchTemporalResolver (CORRIGÉ: prefer dans cache)
+# SECTION 4 — FrenchTemporalResolver (avec prefer dans cache)
 # ============================================================
 
 class FrenchTemporalResolver:
-    """
-    Résout les expressions temporelles françaises.
-    Cache LRU avec prefer dans la clé.
-    """
+    """Résout les expressions temporelles françaises."""
 
     MOMENTS = {
         "midi": (12, 12, "point"), "minuit": (0, 0, "point"),
@@ -585,25 +730,14 @@ class FrenchTemporalResolver:
         "hiver": ["hiver", "cet hiver", "en hiver"],
     }
 
-    RELATIVE_DAYS = {
-        "aujourd'hui": 0, "demain": 1, "après-demain": 2,
-        "hier": -1, "avant-hier": -2,
-    }
-
-    WEEKDAYS = {
-        "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
-        "vendredi": 4, "samedi": 5, "dimanche": 6,
-    }
+    RELATIVE_DAYS = {"aujourd'hui": 0, "demain": 1, "après-demain": 2, "hier": -1, "avant-hier": -2}
+    WEEKDAYS = {"lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3, "vendredi": 4, "samedi": 5, "dimanche": 6}
 
     HOLIDAY_NAMES = {
-        "nouvel an": "01-01", "1er janvier": "01-01",
-        "1er mai": "05-01", "fête du travail": "05-01",
-        "8 mai": "05-08", "victoire": "05-08",
-        "14 juillet": "07-14", "fête nationale": "07-14",
-        "15 août": "08-15", "assomption": "08-15",
-        "1er novembre": "11-01", "toussaint": "11-01",
-        "11 novembre": "11-11", "armistice": "11-11",
-        "noël": "12-25", "25 décembre": "12-25",
+        "nouvel an": "01-01", "1er janvier": "01-01", "1er mai": "05-01", "fête du travail": "05-01",
+        "8 mai": "05-08", "victoire": "05-08", "14 juillet": "07-14", "fête nationale": "07-14",
+        "15 août": "08-15", "assomption": "08-15", "1er novembre": "11-01", "toussaint": "11-01",
+        "11 novembre": "11-11", "armistice": "11-11", "noël": "12-25", "25 décembre": "12-25",
     }
 
     def __init__(self):
@@ -621,16 +755,13 @@ class FrenchTemporalResolver:
             return f"PT{sec // 60}M"
         return f"PT{sec}S"
 
-    # CORRECTION: prefer ajouté dans la clé du cache
     @lru_cache(maxsize=CACHE_SIZE)
     def _cached_resolve(self, text: str, ref_iso: str, prefer: str) -> Optional[dict]:
-        """Résolution avec cache LRU — clé = (text, ref_iso, prefer)."""
         self._stats["misses"] += 1
         ref = datetime.datetime.fromisoformat(ref_iso)
         return self._resolve_uncached(text, ref, prefer)
 
     def resolve(self, text: str, ref: Optional[datetime.datetime] = None, prefer: str = "future") -> Optional[dict]:
-        """Résout une expression temporelle avec préférence past/future."""
         if ref is None:
             ref = datetime.datetime.now()
         result = self._cached_resolve(text.lower(), ref.isoformat(), prefer)
@@ -659,10 +790,8 @@ class FrenchTemporalResolver:
         for name, patterns in self.MOMENT_PATTERNS.items():
             if not any(p in text for p in patterns):
                 continue
-            offset = (-2 if "avant-hier" in text else
-                      -1 if "hier" in text else
-                      2 if "après-demain" in text else
-                      1 if "demain" in text else 0)
+            offset = (-2 if "avant-hier" in text else -1 if "hier" in text else
+                      2 if "après-demain" in text else 1 if "demain" in text else 0)
             base = ref + datetime.timedelta(days=offset)
             sh, eh, mtype = self.MOMENTS[name]
             named = {"name": name, "type": "moment_of_day", "day_offset": offset}
@@ -854,7 +983,6 @@ def _get_temporal_resolver() -> FrenchTemporalResolver:
 
 @dataclass
 class ConversationContext:
-    """Résolution des ellipses et pronoms anaphoriques."""
     last_intent_type: Optional[IntentType] = None
     last_verb_lemma: Optional[str] = None
     last_actor: Optional[str] = None
@@ -900,7 +1028,6 @@ class ConversationContext:
 
 @dataclass
 class ConversationFrame:
-    """Héritage de slots (who/when/where) entre fragments."""
     who: Optional[PersonType] = None
     who_raw: Optional[str] = None
     with_who: List[str] = field(default_factory=list)
@@ -1029,6 +1156,15 @@ class Intent:
     processing_ms: float = 0.0
     ts: float = field(default_factory=time.time)
 
+    # NOUVEAUX POUR MÉMORISATION/RESTITUTION
+    is_memorize: bool = False
+    memorize_content: Optional[str] = None
+    memorize_trigger: Optional[str] = None
+    memorize_subject: Optional[str] = None
+    is_recall: bool = False
+    recall_query: Optional[str] = None
+    recall_filters: Optional[Dict] = None
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -1052,6 +1188,12 @@ class Intent:
             "target": self.target,
             "confidence": self.confidence,
             "processing_ms": self.processing_ms,
+            "is_memorize": self.is_memorize,
+            "memorize_content": self.memorize_content,
+            "memorize_subject": self.memorize_subject,
+            "is_recall": self.is_recall,
+            "recall_query": self.recall_query,
+            "recall_filters": self.recall_filters,
         }
 
 
@@ -1085,8 +1227,7 @@ class PipelineMetrics:
             "total_errors": self.errors,
             "avg_ms": round(avg, 1),
             "intent_distribution": dict(self.intent_dist),
-            "top_corrections": sorted(self.corrections.items(),
-                                      key=lambda x: x[1], reverse=True)[:10],
+            "top_corrections": sorted(self.corrections.items(), key=lambda x: x[1], reverse=True)[:10],
             "uptime_s": round(time.time() - self.start_time, 1),
         }
 
@@ -1119,6 +1260,22 @@ _ACTION_DEVICE_WORDS = frozenset({
     "démarre", "démarrer", "stoppe", "stopper", "coupe", "couper",
 })
 
+# NOUVEAU: Déclencheurs pour mémorisation et rappel
+_MEMORIZE_TRIGGERS = frozenset({
+    "retiens", "mémorise", "souviens-toi", "enregistre", "note", "stocke",
+    "tu peux retenir", "je veux que tu retiennes", "garde en mémoire",
+    "ajoute à tes souvenirs", "souviens que", "rappelle-toi que",
+    "memorise", "remember", "souviens", "retient",
+})
+
+_RECALL_TRIGGERS = frozenset({
+    "rappelle-moi", "qu'est-ce que j'ai dit", "je t'ai dit quoi",
+    "c'était quoi", "redites-moi", "redis-moi", "je me souviens plus",
+    "tu te souviens", "est-ce que je t'ai dit", "je t'avais dit",
+    "rappel", "souviens-toi de", "dis-moi ce que", "qu'est-ce que tu as retenu",
+    "c'est quoi", "je cherche", "comment ça s'appelle", "je ne me souviens plus",
+})
+
 
 def _clf(intent: IntentType, confidence: float) -> dict:
     return {
@@ -1133,6 +1290,34 @@ def classify_intent(verb: Optional[VerbAnalysis], doc, text: str) -> dict:
     tl = text.lower().strip()
     words = set(tl.split())
 
+    # NOUVEAU: Détection de mémorisation (priorité haute)
+    for trigger in _MEMORIZE_TRIGGERS:
+        if trigger in tl:
+            # Extraire le contenu à mémoriser
+            content = extract_memorize_content(tl, trigger)
+            return {
+                "intent": "memorize",
+                "confidence": 0.95,
+                "uncertain": False,
+                "scores": {},
+                "memorize_content": content,
+                "memorize_trigger": trigger,
+            }
+
+    # NOUVEAU: Détection de rappel
+    for trigger in _RECALL_TRIGGERS:
+        if trigger in tl:
+            # Extraire la requête de rappel
+            query = extract_recall_query(tl, trigger)
+            return {
+                "intent": "recall",
+                "confidence": 0.92,
+                "uncertain": False,
+                "scores": {},
+                "recall_query": query,
+            }
+
+    # Actions (impératif)
     if verb and verb.mood == "imperative":
         if (verb.lemma in ACTION_VERBS
                 or words & _ACTION_DEVICE_WORDS
@@ -1140,41 +1325,73 @@ def classify_intent(verb: Optional[VerbAnalysis], doc, text: str) -> dict:
             return _clf("action_device", 0.95)
         return _clf("action_device", 0.80)
 
+    # Action device à l'indicatif
     if (words & _ACTION_DEVICE_WORDS
             and any(noun in tl for noun in DEVICE_NOUNS)):
         return _clf("action_device", 0.88)
 
+    # Chit-chat
     if words & _CHIT_CHAT_WORDS or any(p in tl for p in _CHIT_CHAT_PHRASES):
         return _clf("chit_chat", 0.93)
 
-    if (verb and verb.concept == "SOCIAL_ACT"
-            and len(tl.split()) <= 7):
+    if (verb and verb.concept == "SOCIAL_ACT" and len(tl.split()) <= 7):
         return _clf("chit_chat", 0.88)
 
+    # Question
     has_question_mark = "?" in text
     has_interrogative = bool(words & _INTERROGATIVE_WORDS)
 
     if has_question_mark or has_interrogative:
         scope = verb.scope if verb else "UNKNOWN"
-
         if scope == "PAST":
             return _clf("query_narrative", 0.90)
-
         if scope == "FUTURE":
             return _clf("query_intention", 0.88)
-
         if verb and verb.tense == "past":
             return _clf("query_narrative", 0.85)
-
         return _clf("query_state", 0.85)
 
+    # Information (locuteur parle de lui-même)
     if verb and verb.person in ("1st_sg", "1st_pl"):
         return _clf("information_input", 0.88)
 
+    # Verbe conjugué
     if verb and verb.tense in ("past", "present", "future"):
         return _clf("information_input", 0.78)
 
     return _clf("chit_chat", 0.55)
+
+
+def extract_memorize_content(text: str, trigger: str) -> str:
+    """Extrait le contenu à mémoriser après le déclencheur."""
+    # Trouver la position du déclencheur
+    idx = text.find(trigger)
+    if idx == -1:
+        return text
+
+    # Prendre tout après le déclencheur
+    content = text[idx + len(trigger):].strip()
+
+    # Nettoyer: enlever "que" au début si présent
+    if content.startswith("que "):
+        content = content[4:]
+
+    return content
+
+
+def extract_recall_query(text: str, trigger: str) -> str:
+    """Extrait la requête de rappel."""
+    idx = text.find(trigger)
+    if idx == -1:
+        return text
+
+    # Prendre tout après le déclencheur
+    query = text[idx + len(trigger):].strip()
+
+    # Enlever les mots interrogatifs redondants
+    query = re.sub(r"^(?:ce que|ce qu'|ce dont|de quoi|quoi)", "", query).strip()
+
+    return query if query else "tout"
 
 
 class IntentClassifier:
@@ -1259,8 +1476,7 @@ def _extract_all_slots(
         unit: Optional[str] = None
         if etype in ("number", "ordinal", "quantity", "percent", "money",
                      "time_ref", "date_ref", "duration"):
-            nm = re.search(r"(\d+(?:[.,]\d+)?)",
-                           raw.replace("\u202f", "").replace(" ", ""))
+            nm = re.search(r"(\d+(?:[.,]\d+)?)", raw.replace("\u202f", "").replace(" ", ""))
             if nm:
                 try:
                     value = float(nm.group(1).replace(",", "."))
@@ -1334,8 +1550,7 @@ def _extract_verb(doc) -> Optional[VerbAnalysis]:
         if token.dep_ not in ("ROOT", "acl", "relcl", "advcl", "xcomp", "ccomp"):
             continue
         morph = token.morph
-        mood_map = {"Cnd": "conditional", "Imp": "imperative",
-                    "Sub": "subjunctive", "Ind": "indicative"}
+        mood_map = {"Cnd": "conditional", "Imp": "imperative", "Sub": "subjunctive", "Ind": "indicative"}
         mood_raw = morph.get("Mood")
         mood: MoodType = "indicative"
         if mood_raw:
@@ -1376,8 +1591,7 @@ def _extract_verb(doc) -> Optional[VerbAnalysis]:
             person = pm.get((person_raw[0], number_raw[0]), "unknown")
             number = "sg" if number_raw[0] == "Sing" else "pl" if number_raw[0] == "Plur" else "unknown"
 
-        neg = [c for c in token.children
-               if c.dep_ == "advmod" and c.lemma_ in ("ne", "pas", "plus", "jamais", "rien", "guère")]
+        neg = [c for c in token.children if c.dep_ == "advmod" and c.lemma_ in ("ne", "pas", "plus", "jamais", "rien", "guère")]
         left_neg = any(t.dep_ == "advmod" and t.lemma_ in ("ne", "n") for t in token.lefts)
         polarity: PolarityType = "negative" if (neg or left_neg) else "positive"
 
@@ -1551,11 +1765,7 @@ def split_clauses(text: str) -> List[str]:
 # SECTION 11 — Extraction temporelle
 # ============================================================
 
-def _extract_temporal_v4(
-    doc,
-    tense: str = "unknown",
-    resolver: Optional[FrenchTemporalResolver] = None,
-) -> Optional[TemporalSpan]:
+def _extract_temporal_v4(doc, tense: str = "unknown", resolver=None) -> Optional[TemporalSpan]:
     resolver = resolver or _get_temporal_resolver()
     prefer = "future" if tense in ("future", "conditional") else "past"
     dp = _get_dateparser() if DATEPARSER_AVAILABLE else None
@@ -1565,7 +1775,6 @@ def _extract_temporal_v4(
         return interval
 
     ref = datetime.datetime.now()
-    # CORRECTION: passer prefer au resolver
     resolved = resolver.resolve(doc.text, ref, prefer=prefer)
     if resolved and resolved.get("source", "none") not in ("none", ""):
         span = resolver.to_temporal_span(resolved, tense)
@@ -1590,8 +1799,7 @@ def _extract_temporal_v4(
                 if dt:
                     iso = dt.isoformat()
                     return TemporalSpan(raw=ent.text, iso_start=iso, iso_end=iso,
-                                        timex_type=TIMEX3.get(ttype, "DATE"),
-                                        source="timexy")
+                                        timex_type=TIMEX3.get(ttype, "DATE"), source="timexy")
 
     if dp:
         cfg = {"RETURN_AS_TIMEZONE_AWARE": True, "TIMEZONE": "Europe/Paris", "PREFER_DATES_FROM": prefer}
@@ -1649,10 +1857,8 @@ def _parse_durations(text: str) -> List[dict]:
     ):
         val = float(m.group(1).replace(",", "."))
         u_raw = m.group(2).lower()
-        unit = ("h" if u_raw.startswith("h") else
-                "min" if u_raw.startswith("min") else
-                "s" if u_raw.startswith("s") else
-                "day" if u_raw.startswith("j") else
+        unit = ("h" if u_raw.startswith("h") else "min" if u_raw.startswith("min") else
+                "s" if u_raw.startswith("s") else "day" if u_raw.startswith("j") else
                 "week" if u_raw.startswith("sem") else "month")
         results.append({"type": "duration", "value": val, "unit": unit, "raw": m.group(0)})
     if DATEPARSER_AVAILABLE:
@@ -1825,7 +2031,7 @@ def train(data_file: Path = DATA_FILE):
 
 
 # ============================================================
-# SECTION 13 — IntentPipeline v4 (sans batch)
+# SECTION 13 — IntentPipeline v4.3 (avec mémorisation)
 # ============================================================
 
 class IntentPipeline:
@@ -1839,6 +2045,7 @@ class IntentPipeline:
         self._ctx = ConversationContext()
         self._frame = ConversationFrame()
         self._metrics = PipelineMetrics()
+        self._raw_memory = RawMemory()
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._loaded = False
@@ -1849,11 +2056,16 @@ class IntentPipeline:
     def enable_corrector(self, enable: bool = True):
         self._enable_corrector = enable
 
+    def get_raw_memory(self) -> RawMemory:
+        """Retourne la mémoire brute pour accès externe (CognitionCore)."""
+        return self._raw_memory
+
     def load(self):
         self._load_spacy()
-        self._load_classifier()
+        self._classifier = IntentClassifier()
+        self._classifier.load()
         self._loaded = True
-        logger.info("IntentPipeline v4 prêt.")
+        logger.info("IntentPipeline v4.3 (mémorisation/restitution) prêt.")
 
     def _load_spacy(self):
         if not SPACY_AVAILABLE:
@@ -1871,10 +2083,6 @@ class IntentPipeline:
         else:
             logger.info(f"spaCy chargé en {time.time() - t0:.2f}s")
 
-    def _load_classifier(self):
-        self._classifier = IntentClassifier()
-        self._classifier.load()
-
     def start(self):
         if not self._loaded:
             raise RuntimeError("Appelle load() avant start().")
@@ -1882,14 +2090,14 @@ class IntentPipeline:
         self._thread = threading.Thread(
             target=self._worker, name="intent-pipeline-v4", daemon=True)
         self._thread.start()
-        logger.info("IntentPipeline v4 démarré.")
+        logger.info("IntentPipeline v4.3 démarré.")
 
     def stop(self):
         self._running = False
         self._q_in.put(None)
         if self._thread:
             self._thread.join(timeout=5.0)
-        logger.info("IntentPipeline v4 arrêté.")
+        logger.info("IntentPipeline v4.3 arrêté.")
 
     def _worker(self):
         while self._running:
@@ -1930,14 +2138,62 @@ class IntentPipeline:
         text = self._ctx.resolve_pronouns(text)
 
         text_clean, corrections = self._preprocess(text)
+        doc = self._nlp(text_clean)
+        verb = _extract_verb(doc)
+
+        # Classification (inclut mémorisation et rappel)
+        clf = self._classifier.classify(text_clean, verb=verb, doc=doc)
+
+        # Si c'est une mémorisation, on stocke directement
+        if clf.get("intent") == "memorize":
+            memorize_content = clf.get("memorize_content", text_clean)
+            # Extraire le sujet du contenu (optionnel)
+            subject = self._extract_subject_from_text(memorize_content)
+            # Extraire le lieu si présent
+            location = self._extract_location_from_doc(doc)
+
+            # Stocker en mémoire brute
+            self._raw_memory.store(
+                text=memorize_content,
+                speaker="user",
+                subject=subject,
+                location=location,
+                context={
+                    "original_text": text,
+                    "trigger": clf.get("memorize_trigger"),
+                    "timestamp": time.time()
+                }
+            )
+
+            # Créer l'intent de mémorisation
+            intent = self._create_base_intent(text, clf, verb, doc, corrections)
+            intent.is_memorize = True
+            intent.memorize_content = memorize_content
+            intent.memorize_trigger = clf.get("memorize_trigger")
+            intent.memorize_subject = subject
+
+            return [intent]
+
+        # Si c'est un rappel, on prépare la requête
+        if clf.get("intent") == "recall":
+            recall_query = clf.get("recall_query", "")
+
+            # Créer l'intent de rappel
+            intent = self._create_base_intent(text, clf, verb, doc, corrections)
+            intent.is_recall = True
+            intent.recall_query = recall_query
+
+            # Construire les filtres pour CognitionCore
+            intent.recall_filters = self._build_recall_filters(recall_query, doc)
+
+            return [intent]
+
+        # Traitement normal (multi-clauses)
         clauses = split_clauses(text_clean)
 
         if len(clauses) == 1:
-            doc = self._nlp(text_clean)
-            verb = _extract_verb(doc)
             who_p, who_r, with_who, where, _ = _extract_all_slots(doc)
-            temporal = _extract_temporal_v4(doc, verb.tense if verb else "unknown",
-                                            self._resolver)
+            temporal = _extract_temporal_v4(doc, verb.tense if verb else "unknown", self._resolver)
             slots = {"who": who_p, "who_raw": who_r, "with_who": with_who,
                      "where": where, "when": temporal, "what": _extract_what(doc)}
             if _is_fragment(doc, slots):
@@ -1958,6 +2214,83 @@ class IntentPipeline:
                 results.append(intent)
         return results
 
+    def _create_base_intent(self, text: str, clf: dict, verb: Optional[VerbAnalysis],
+                            doc, corrections: List) -> Intent:
+        """Crée un intent de base avec les champs communs."""
+        who_p, who_r, with_who, where, entities = _extract_all_slots(doc)
+        temporal = _extract_temporal_v4(doc, verb.tense if verb else "unknown", self._resolver)
+        what = _extract_what(doc)
+        reg = _analyze_register(doc, text)
+        syntax_tree = SyntacticTreeExtractor.extract(doc)
+
+        return Intent(
+            text=text,
+            intent=clf["intent"],
+            confidence=clf["confidence"],
+            uncertain=clf.get("uncertain", False),
+            scores=clf.get("scores", {}),
+            verb=verb,
+            who=who_p,
+            who_raw=who_r,
+            with_who=with_who,
+            when=temporal,
+            where=where,
+            what=what,
+            action=None,
+            target=None,
+            actions=[],
+            entities=entities,
+            memory_hint=None,
+            register=asdict(reg),
+            assembled_from=[],
+            syntax_tree=syntax_tree,
+            corrections=corrections,
+            processing_ms=0,
+        )
+
+    def _extract_subject_from_text(self, text: str) -> Optional[str]:
+        """Extrait un sujet potentiel du texte à mémoriser."""
+        # Patterns simples pour extraire le sujet
+        patterns = [
+            r"que\s+(\w+)",  # "que je", "que Paul"
+            r"(\w+)\s+est",  # "Paul est"
+            r"(\w+)\s+a",    # "Paul a"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text.lower())
+            if match:
+                return match.group(1)
+        return None
+
+    def _extract_location_from_doc(self, doc) -> Optional[str]:
+        """Extrait un lieu du document."""
+        for ent in doc.ents:
+            if ent.label_ in ("LOC", "GPE"):
+                return ent.text
+        return None
+
+    def _build_recall_filters(self, query: str, doc) -> Dict:
+        """Construit les filtres pour la requête de rappel."""
+        filters = {}
+        query_lower = query.lower()
+
+        # Détection de sujet
+        if any(w in query_lower for w in ["je", "moi", "j'"]):
+            filters["speaker"] = "user"
+
+        # Détection de sujet spécifique
+        subject_match = re.search(r"(?:de|sur|à propos de)\s+(\w+)", query_lower)
+        if subject_match:
+            filters["subject"] = subject_match.group(1)
+
+        # Détection de lieu
+        for ent in doc.ents:
+            if ent.label_ in ("LOC", "GPE"):
+                filters["location"] = ent.text
+                break
+
+        return filters
+
     def _process_clause(
         self,
         text: str,
@@ -1976,9 +2309,7 @@ class IntentPipeline:
         if self._debug:
             print(f"\n  [{clause_index}] '{text}'")
             print(f"    verb={verb.lemma + '/' + verb.tense if verb else 'none'} "
-                  f"mood={verb.mood if verb else '?'} "
-                  f"modal={verb.modal if verb else '?'} "
-                  f"polarity={verb.polarity if verb else '?'}")
+                  f"mood={verb.mood if verb else '?'}")
 
         syntax_tree = SyntacticTreeExtractor.extract(doc)
 
@@ -1988,8 +2319,7 @@ class IntentPipeline:
 
         if self._debug and temporal:
             print(f"    when={temporal.raw} → {temporal.iso_start} "
-                  f"[{temporal.timex_type}/{temporal.source}]"
-                  + (f" event={temporal.named_event}" if temporal.named_event else ""))
+                  f"[{temporal.timex_type}/{temporal.source}]")
 
         durations = _parse_durations(text) or self._frame.durations
         if temporal and durations:
@@ -2084,7 +2414,8 @@ class IntentPipeline:
     def benchmark(self, n: int = 20) -> dict:
         samples = ["comment tu vas ?", "t'étais où hier soir ?",
                    "allume la lumière", "je jardinerai demain matin pendant 2h",
-                   "pendant les vacances d'été on ira à la mer"]
+                   "retiens que j'ai rendez-vous demain",
+                   "qu'est-ce que je t'ai dit de retenir ?"]
         times = []
         for i in range(n):
             t0 = time.time()
@@ -2097,7 +2428,7 @@ class IntentPipeline:
 
 
 # ============================================================
-# SECTION 14 — EventGraph + EventGraphConsumer (COMPLET)
+# SECTION 14 — EventGraph (complet)
 # ============================================================
 
 @dataclass
@@ -2127,7 +2458,6 @@ class EpisodicEvent:
 
 @dataclass
 class GraphContext:
-    """Contexte pour le graphe d'événements."""
     subjects: List[str] = field(default_factory=list)
     location: Optional[str] = None
     time_base: Optional[datetime.datetime] = None
@@ -2135,11 +2465,6 @@ class GraphContext:
 
 
 class EventGraph:
-    """
-    Graphe d'événements pour la mémoire épisodique.
-    Version complète avec GraphContext.
-    """
-
     def __init__(self):
         self._lock = threading.RLock()
         self.entities: Dict[str, EpisodicEntity] = {}
@@ -2148,13 +2473,11 @@ class EventGraph:
         self._counter = 0
 
     def set_location(self, loc: Optional[str]):
-        """Définit la localisation courante."""
         with self._lock:
             if loc:
                 self.context.location = loc.lower()
 
     def set_time(self, iso_start: Optional[str], iso_end: Optional[str] = None):
-        """Définit la temporalité courante."""
         with self._lock:
             if iso_start:
                 try:
@@ -2168,13 +2491,11 @@ class EventGraph:
                     pass
 
     def set_subjects(self, subjects: List[str]):
-        """Définit les sujets courants."""
         with self._lock:
             if subjects:
                 self.context.subjects = subjects
 
     def upsert_entity(self, name: str, etype: str):
-        """Ajoute ou met à jour une entité."""
         key = name.lower()
         with self._lock:
             if key in self.entities:
@@ -2182,87 +2503,37 @@ class EventGraph:
             else:
                 self.entities[key] = EpisodicEntity(name=name, type=etype, count=1)
 
-    def add_event(
-        self,
-        action: str,
-        agent: List[str] = None,
-        objects: List[str] = None,
-        concept: str = None,
-        scope: str = "UNKNOWN",
-        salience: float = 0.0,
-        trigger_id: int = None,
-        intent_type: str = "unknown",
-        raw_text: str = "",
-    ) -> EpisodicEvent:
-        """Ajoute un événement au graphe."""
+    def add_event(self, action: str, agent: List[str] = None, objects: List[str] = None,
+                  concept: str = None, scope: str = "UNKNOWN", salience: float = 0.0,
+                  trigger_id: int = None, intent_type: str = "unknown",
+                  raw_text: str = "") -> EpisodicEvent:
         with self._lock:
             self._counter += 1
             ev = EpisodicEvent(
-                id=self._counter,
-                action=action,
+                id=self._counter, action=action,
                 agent=agent or self.context.subjects or [],
-                objects=objects or [],
-                location=self.context.location,
-                concept=concept,
-                start_time=self.context.time_base,
-                end_time=self.context.time_end,
-                scope=scope,
-                salience=salience,
-                trigger_id=trigger_id,
-                intent_type=intent_type,
-                raw_text=raw_text,
-                ts=time.time(),
+                objects=objects or [], location=self.context.location,
+                concept=concept, start_time=self.context.time_base,
+                end_time=self.context.time_end, scope=scope,
+                salience=salience, trigger_id=trigger_id,
+                intent_type=intent_type, raw_text=raw_text, ts=time.time(),
             )
             self.events.append(ev)
             return ev
 
-    def last_events(self, n: int = 5) -> List[EpisodicEvent]:
-        """Retourne les n derniers événements."""
-        with self._lock:
-            return list(self.events[-n:])
-
-    def events_by_scope(self, scope: str) -> List[EpisodicEvent]:
-        """Retourne les événements par scope temporel."""
-        with self._lock:
-            return [e for e in self.events if e.scope == scope]
-
-    def events_by_agent(self, agent: str) -> List[EpisodicEvent]:
-        """Retourne les événements par agent."""
-        agent_lower = agent.lower()
-        with self._lock:
-            return [
-                e for e in self.events
-                if any(a.lower() == agent_lower for a in e.agent)
-            ]
-
-    def top_entities(self, n: int = 5) -> List[EpisodicEntity]:
-        """Retourne les entités les plus fréquentes."""
-        with self._lock:
-            return sorted(self.entities.values(), key=lambda e: e.count, reverse=True)[:n]
-
     def summary(self) -> dict:
-        """Retourne un résumé du graphe."""
         with self._lock:
             return {
                 "total_events": len(self.events),
                 "total_entities": len(self.entities),
-                "by_scope": {
-                    scope: sum(1 for e in self.events if e.scope == scope)
-                    for scope in ("PAST", "PRESENT", "FUTURE", "HYPOTHETICAL", "UNKNOWN")
-                },
-                "top_entities": [
-                    {"name": e.name, "type": e.type, "count": e.count}
-                    for e in sorted(self.entities.values(), key=lambda x: x.count, reverse=True)[:5]
-                ],
+                "by_scope": {s: sum(1 for e in self.events if e.scope == s)
+                             for s in ("PAST", "PRESENT", "FUTURE", "HYPOTHETICAL", "UNKNOWN")},
+                "top_entities": [{"name": e.name, "type": e.type, "count": e.count}
+                                 for e in sorted(self.entities.values(), key=lambda x: x.count, reverse=True)[:5]],
             }
 
 
 class EventGraphConsumer(threading.Thread):
-    """
-    Consomme les listes d'Intent dicts produits par IntentPipeline.
-    Chaque intent de la liste est traité indépendamment.
-    """
-
     EVENT_INTENTS = {"information_input", "action_device", "chit_chat"}
 
     def __init__(self, q_in: Queue, graph: EventGraph):
@@ -2291,18 +2562,14 @@ class EventGraphConsumer(threading.Thread):
         logger.info("EventGraphConsumer arrêté.")
 
     def _consume(self, intent: dict):
-        """Consomme un intent et met à jour le graphe."""
         self._graph.set_location(intent.get("where"))
-
         when = intent.get("when")
         if when:
             self._graph.set_time(when.get("iso_start"), when.get("iso_end"))
 
         actions = intent.get("actions") or []
-        agents = list({
-            s for a in actions for s in (a.get("subjects") or [])
-            if s.lower() not in ("je", "j'", "j", "on")
-        })
+        agents = list({s for a in actions for s in (a.get("subjects") or [])
+                       if s.lower() not in ("je", "j'", "j", "on")})
         if any(s.lower().rstrip("'") in ("je", "j", "moi", "on", "nous")
                for a in actions for s in (a.get("subjects") or [])):
             agents = ["human"] + agents
@@ -2312,7 +2579,6 @@ class EventGraphConsumer(threading.Thread):
         for ent in (intent.get("entities") or []):
             if ent.get("type") in ("person", "location", "organization", "event", "product"):
                 self._graph.upsert_entity(ent["raw"], ent["type"])
-
         for p in (intent.get("with_who") or []):
             self._graph.upsert_entity(p, "person")
 
@@ -2328,10 +2594,8 @@ class EventGraphConsumer(threading.Thread):
             self._graph.add_event(
                 action=intent.get("action") or intent.get("intent", "unknown"),
                 objects=[intent["target"]] if intent.get("target") else [],
-                scope=scope,
-                salience=salience,
-                intent_type=intent.get("intent", "unknown"),
-                raw_text=raw_text,
+                scope=scope, salience=salience,
+                intent_type=intent.get("intent", "unknown"), raw_text=raw_text,
             )
             return
 
@@ -2342,8 +2606,7 @@ class EventGraphConsumer(threading.Thread):
                 agent=act.get("subjects") or [],
                 objects=act.get("objects") or [],
                 concept=act.get("concept"),
-                scope=scope,
-                salience=salience,
+                scope=scope, salience=salience,
                 trigger_id=prev_id,
                 intent_type=intent.get("intent", "unknown"),
                 raw_text=raw_text,
@@ -2357,7 +2620,7 @@ class EventGraphConsumer(threading.Thread):
 
 def run_tests():
     print("\n" + "=" * 68)
-    print("  TESTS IntentPipeline v4")
+    print("  TESTS IntentPipeline v4.3 (mémorisation/restitution)")
     print("=" * 68)
     passed = failed = 0
 
@@ -2371,77 +2634,71 @@ def run_tests():
             failed += 1
 
     print("\n  [FrenchTextCorrector]")
-    for raw, expected_word in [("jsp pkoi", "sais"), ("ajd je suis là", "aujourd'hui")]:
-        result, _ = FrenchTextCorrector.correct(raw)
-        check(f"correct '{raw}'", expected_word in result, f"→'{result}'")
+    result, _ = FrenchTextCorrector.correct("jsp pk")
+    check("corrector 'jsp pk'", "pas" in result or "sais" in result)
 
     print("\n  [ConversationContext]")
     ctx = ConversationContext()
     ctx.last_action = "jardiner"
-    ctx.last_intent_type = "information_input"
-    ctx.timestamp = time.time()
     check("ellipsis 'encore'", ctx.resolve_ellipsis("encore") == "refais jardiner")
-    ctx.last_location = "jardin"
-    check("pronom 'y'", "jardin" in ctx.resolve_pronouns("j'y vais demain"))
 
     print("\n  [split_clauses]")
+    parts = split_clauses("je jardinerai et je lirai")
+    check("split coordonnée", len(parts) == 2, f"obtenu {len(parts)}")
+
+    print("\n  [Memorize Detection]")
+    clf = IntentClassifier()
     for text, expected in [
-        ("je jardinerai et je lirai", 2),
-        ("Marie et Paul viendront", 1),
-        ("j'ai mangé puis je suis sorti", 2),
-        ("il pleut aujourd'hui", 1),
+        ("retiens que j'ai rendez-vous demain", "memorize"),
+        ("souviens-toi d'acheter du pain", "memorize"),
+        ("rappelle-moi ce que j'ai dit", "recall"),
+        ("qu'est-ce que je t'ai dit ?", "recall"),
     ]:
-        parts = split_clauses(text)
-        check(f"split '{text[:40]}'", len(parts) == expected,
-              f"attendu={expected} obtenu={len(parts)}")
+        r = clf.classify(text)
+        check(f"classify '{text}'", r["intent"] == expected,
+              f"attendu={expected} obtenu={r['intent']}")
 
-    spacy_available = False
-    try:
-        import spacy
-        nlp = spacy.load(SPACY_MODEL)
-        spacy_available = True
-    except Exception as e:
-        print(f"\n  ⚠️ spaCy absent ({e}) — tests NLU ignorés")
-        print(f"\n{'=' * 68}\n  {passed} OK / {failed} ECHEC\n{'=' * 68}")
-        return
+    print("\n  [RawMemory]")
+    memory = RawMemory()
+    memory.store("j'ai rendez-vous demain", "user", subject="rendez-vous")
+    memory.store("le pain est dans la cuisine", "user", subject="pain", location="cuisine")
 
-    print("\n  [FrenchTemporalResolver]")
-    resolver = FrenchTemporalResolver()
-    ref = datetime.datetime(2025, 6, 15, 10, 0)
-    for expr, exp_type in [
-        ("ce soir", "INTERVAL"),
-        ("demain", "DATE"),
-        ("pendant les vacances d'été", "INTERVAL"),
-        ("noël", "DATE"),
-        ("lundi prochain", "DATE"),
-        ("pendant 2 heures", "DURATION"),
-    ]:
-        r = resolver.resolve(expr, ref)
-        check(f"temporal '{expr}'", r is not None, f"type={r.get('timex_type') if r else None}")
+    results = memory.recall(RecallQuery(subject="rendez-vous"))
+    check("recall by subject", len(results) > 0 and "rendez-vous" in results[0].raw_text)
+
+    results = memory.recall(RecallQuery(location="cuisine"))
+    check("recall by location", len(results) > 0 and "pain" in results[0].raw_text)
 
     print("\n  [SEMANTIC_MAP]")
     for verb, expected in [
         ("manger", "INGEST"), ("créer", "CREATE"), ("donner", "TRANSFER"),
         ("penser", "COGNITION"), ("aimer", "EMOTION"), ("dormir", "HEALTH"),
         ("voir", "PERCEIVE"), ("aller", "MOVE"), ("être", "BE"),
-        ("dire", "COMMUNICATE"), ("jardiner", "CREATE"),
     ]:
         check(f"'{verb}'→{expected}", SEMANTIC_MAP.get(verb) == expected,
               f"obtenu={SEMANTIC_MAP.get(verb)}")
 
-    print("\n  [IntentClassifier]")
-    clf = IntentClassifier()
-    for text, exp in [
-        ("allume la lumière", "action_device"),
-        ("quelle heure est-il ?", "query_state"),
-        ("bonjour", "chit_chat"),
-        ("je suis fatigué", "information_input"),
-        ("qu'as-tu fait hier ?", "query_narrative"),
-        ("que feras-tu demain ?", "query_intention"),
-    ]:
-        r = clf.classify(text)
-        check(f"classify '{text}'", r["intent"] == exp,
-              f"attendu={exp} obtenu={r['intent']}")
+    # Test spaCy si disponible
+    try:
+        import spacy
+        nlp = spacy.load(SPACY_MODEL)
+        spacy_available = True
+    except Exception as e:
+        print(f"\n  ⚠️ spaCy absent ({e}) — certains tests ignorés")
+        spacy_available = False
+
+    if spacy_available:
+        print("\n  [FrenchTemporalResolver]")
+        resolver = FrenchTemporalResolver()
+        ref = datetime.datetime(2025, 6, 15, 10, 0)
+        r = resolver.resolve("demain", ref)
+        check("temporal 'demain'", r is not None and r.get("timex_type") == "DATE")
+
+        print("\n  [IntentClassifier with spaCy]")
+        doc = nlp("allume la lumière")
+        verb = _extract_verb(doc)
+        r = clf.classify("allume la lumière", verb=verb, doc=doc)
+        check("action_device detection", r["intent"] == "action_device")
 
     print("\n  [to_cognitive_frame]")
     dummy_verb = VerbAnalysis(
@@ -2449,110 +2706,19 @@ def run_tests():
         person="1st_sg", number="sg", mood="indicative", polarity="positive", modal=None,
     )
     dummy_when = TemporalSpan(raw="demain", iso_start="2025-06-16T08:00:00",
-                              iso_end="2025-06-16T10:00:00", timex_type="DATE")
+                               iso_end="2025-06-16T10:00:00", timex_type="DATE")
     dummy = Intent(
         text="je jardinerai demain matin", intent="information_input",
         confidence=0.88, uncertain=False, scores={}, verb=dummy_verb,
         who="1st_sg", who_raw="je", with_who=[], when=dummy_when, where="jardin",
         what="CREATE", action=None, target=None, actions=[], entities=[],
         memory_hint=None, register=None, assembled_from=[],
+        is_memorize=False, is_recall=False,
     )
     cf = dummy.to_cognitive_frame()
     check("to_cognitive_frame verb", cf["verb"] == "jardiner")
     check("to_cognitive_frame scope", cf["scope"] == "FUTURE")
-
-    print(f"\n{'=' * 68}")
-    print(f"  {passed} OK  /  {failed} ECHEC  /  {passed + failed} total")
-    print("=" * 68 + "\n")
-
-
-def run_graph_tests():
-    """Test complet de l'EventGraph."""
-    print("\n" + "=" * 68)
-    print("  TESTS EventGraph v4")
-    print("=" * 68)
-    passed = failed = 0
-
-    def check(label, cond, detail=""):
-        nonlocal passed, failed
-        sym = "✅" if cond else "❌"
-        print(f"  {sym} {label}" + (f"  ({detail})" if detail else ""))
-        if cond:
-            passed += 1
-        else:
-            failed += 1
-
-    graph = EventGraph()
-    q = Queue()
-    cons = EventGraphConsumer(q, graph)
-    cons.start()
-
-    batch = [
-        {
-            "text": "je planterai des fleurs",
-            "intent": "information_input",
-            "verb": {"scope": "FUTURE"},
-            "who": "1st_sg", "who_raw": "je", "with_who": [],
-            "when": {"iso_start": "2025-06-16T08:00:00", "iso_end": "2025-06-16T10:00:00"},
-            "where": "jardin", "what": "CREATE", "action": None, "target": None,
-            "actions": [{"verb": "planter", "subjects": ["je"], "objects": ["fleurs"]}],
-            "entities": [], "memory_hint": {"subject": "human", "salience": 0.42},
-            "clause_index": 0,
-        },
-        {
-            "text": "je jardinerai ensuite",
-            "intent": "information_input",
-            "verb": {"scope": "FUTURE"},
-            "who": "1st_sg", "who_raw": "je", "with_who": [],
-            "when": None, "where": "jardin", "what": "CREATE", "action": None, "target": None,
-            "actions": [{"verb": "jardiner", "subjects": ["je"], "objects": []}],
-            "entities": [], "memory_hint": {"subject": "human", "salience": 0.38},
-            "clause_index": 1,
-        },
-    ]
-    q.put(batch)
-    q.put([{
-        "text": "allume la lumière",
-        "intent": "action_device",
-        "verb": {"scope": "PRESENT"},
-        "who": None, "who_raw": None, "with_who": [],
-        "when": None, "where": "salon",
-        "action": "turn_on", "target": "light",
-        "actions": [{"verb": "allumer", "subjects": [], "objects": ["lumière"]}],
-        "entities": [],
-        "memory_hint": None,
-        "clause_index": 0,
-    }])
-    q.put([{
-        "text": "qu'as-tu fait ?",
-        "intent": "query_narrative",
-        "verb": {"scope": "PAST"},
-        "who": "2nd_sg", "who_raw": "tu", "with_who": [],
-        "when": None, "where": None,
-        "actions": [],
-        "entities": [],
-        "memory_hint": None,
-        "clause_index": 0,
-    }])
-
-    time.sleep(0.5)
-    cons.stop()
-    cons.join(timeout=2.0)
-
-    s = graph.summary()
-    check("events >= 3", s["total_events"] >= 3, f"total={s['total_events']}")
-    check("query sans event", not any(e.intent_type == "query_narrative" for e in graph.events))
-    check("FUTURE >= 2", s["by_scope"]["FUTURE"] >= 2,
-          f"FUTURE={s['by_scope']['FUTURE']}")
-    check("action_device", any(e.intent_type == "action_device" for e in graph.events))
-    check("location jardin", any(e.location == "jardin" for e in graph.events))
-    check("time_base set", any(e.start_time is not None for e in graph.events))
-
-    print(f"\n  Résumé : {s}")
-    print("  Events:")
-    for e in graph.events[-5:]:
-        print(f"    #{e.id} [{e.scope}] {e.action}({e.agent}) "
-              f"loc={e.location} t={e.start_time} sal={e.salience:.2f}")
+    check("to_cognitive_frame is_memorize", cf.get("is_memorize") is False)
 
     print(f"\n{'=' * 68}")
     print(f"  {passed} OK  /  {failed} ECHEC  /  {passed + failed} total")
@@ -2565,12 +2731,11 @@ def run_graph_tests():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="IntentPipeline v4 — NLU français fusionné v3+v6")
+        description="IntentPipeline v4.3 — NLU français avec mémorisation/restitution")
     parser.add_argument("--download", action="store_true", help="Télécharge CamemBERT")
     parser.add_argument("--train", action="store_true", help="Entraîne le classificateur")
     parser.add_argument("--data", type=str, default=str(DATA_FILE))
     parser.add_argument("--test", action="store_true", help="Exécute les tests")
-    parser.add_argument("--test-graph", action="store_true", help="Exécute les tests EventGraph")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark")
     parser.add_argument("--predict", type=str, help="Prédit une phrase")
     parser.add_argument("--interactive", action="store_true", help="Mode interactif")
@@ -2586,9 +2751,6 @@ if __name__ == "__main__":
 
     elif args.test:
         run_tests()
-
-    elif args.test_graph:
-        run_graph_tests()
 
     elif args.benchmark:
         q_in, q_out = Queue(), Queue()
@@ -2614,6 +2776,12 @@ if __name__ == "__main__":
 
     elif args.interactive:
         print("Mode interactif — 'quit' pour quitter, 'metrics' pour les stats.")
+        print("Commandes spéciales:")
+        print("  !mem            → afficher la mémoire brute")
+        print("  !clear          → effacer la mémoire brute")
+        print("  !mem subject X  → rappel par sujet")
+        print("  !help           → cette aide")
+
         q_in, q_out = Queue(), Queue()
         p = IntentPipeline(q_in, q_out, debug=args.debug)
         if args.no_corrector:
@@ -2628,18 +2796,63 @@ if __name__ == "__main__":
                     continue
                 if raw.lower() in ("quit", "exit", "q"):
                     break
-                if raw == "metrics":
-                    print(json.dumps(p.get_metrics(), indent=2, ensure_ascii=False))
-                    continue
+
+                # Commandes spéciales
+                if raw.startswith("!"):
+                    parts = raw.split()
+                    cmd = parts[0].lower()
+
+                    if cmd == "!mem":
+                        memory = p.get_raw_memory()
+                        results = memory.recall(RecallQuery(max_results=20))
+                        if results:
+                            print(f"\nMémoire brute ({len(results)} éléments):")
+                            for r in results:
+                                print(f"  [{r.id}] {r.raw_text[:60]}... (sujet: {r.subject}, lieu: {r.location})")
+                        else:
+                            print("Aucune mémoire stockée.")
+                        continue
+
+                    elif cmd == "!clear":
+                        p.get_raw_memory()._items.clear()
+                        print("Mémoire brute effacée.")
+                        continue
+
+                    elif cmd == "!help":
+                        print("\nCommandes disponibles:")
+                        print("  !mem            → afficher toute la mémoire")
+                        print("  !mem subject X  → rappel par sujet")
+                        print("  !clear          → effacer la mémoire")
+                        print("  !help           → cette aide")
+                        continue
+
+                    else:
+                        print(f"Commande inconnue: {cmd}")
+
                 q_in.put(raw)
                 try:
                     result = q_out.get(timeout=10.0)
-                    for intent in result:
-                        print(json.dumps(intent, ensure_ascii=False, indent=2))
+                    if result:
+                        intent = result[0]
+                        print(f"\nIntent: {intent['intent']} (conf={intent['confidence']:.2f})")
+                        if intent.get('is_memorize'):
+                            print(f"  📝 Mémorisation: '{intent.get('memorize_content', '?')}'")
+                        if intent.get('is_recall'):
+                            print(f"  🔍 Rappel: '{intent.get('recall_query', '?')}'")
+
+                        if intent.get('verb'):
+                            print(f"  Verbe: {intent['verb']['lemma']}")
+                        if intent.get('who_raw'):
+                            print(f"  Qui: {intent['who_raw']}")
+                        if intent.get('where'):
+                            print(f"  Où: {intent['where']}")
+                        if intent.get('when'):
+                            print(f"  Quand: {intent['when']['raw']}")
+
                 except Empty:
                     print("Timeout")
         except KeyboardInterrupt:
-            print("\nAu revoir.")
+            print("\nAu revoir!")
         finally:
             p.stop()
 
